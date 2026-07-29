@@ -1,7 +1,8 @@
 # The CodeScribe loop
 
-A bounded agentic loop, driven by Anthropic models, as a single
-compiled binary built on the design of Lab-Notebooks/CodeScribe's author/reviewer loop
+A bounded agentic loop driven by Anthropic models, packaged as a single
+compiled binary based on the open source research work performed
+with CodeScribe (https://github.com/Lab-Notebooks/CodeScribe)
 
 ## Install
 
