@@ -1,7 +1,7 @@
-# csloop
+# The CodeScribe loop
 
-A bounded author/review coding-agent loop, driven by Anthropic models, as a single
-compiled binary.
+A bounded agentic loop, driven by Anthropic models, as a single
+compiled binary built on the design of Lab-Notebooks/CodeScribe's author/reviewer loop
 
 ## Install
 
