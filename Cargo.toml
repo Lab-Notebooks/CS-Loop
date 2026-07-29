@@ -1,7 +1,23 @@
 [package]
-name = "scribe_rs"
+name = "csloop"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Bounded author/review agent loop against Anthropic models"
+repository = "https://github.com/Lab-Notebooks/csloop"
+
+[[bin]]
+name = "csloop"
+path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.3.0", features = ["derive"] }
+clap        = { version = "4", features = ["derive", "env"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.9"
+ureq        = { version = "3", features = ["json"] }
+anyhow      = "1"
+glob        = "0.3"
+indicatif   = "0.18"
+shell-words = "1"
+time        = { version = "0.3", features = ["formatting"] }

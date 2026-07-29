@@ -1,72 +1,41 @@
-mod commands;
+mod agent;
+mod chat_template;
+mod cli;
+mod logging;
+mod loop_runner;
+mod model;
+mod observer;
+mod paths;
+mod telemetry;
+mod tools;
 
-use clap::{CommandFactory, Parser};
-use commands::{index, draft, translate, generate, update, inspect, format};
+use clap::Parser;
 
-#[derive(Parser)]
-#[command(name = "scribe-rs")]
-#[command(version = "0.1.0")]
-#[command(about = "A Rust application inspired by the reference Python CLI")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(clap::Subcommand)]
-enum Commands {
-    Index { root_dir: String },
-    Draft { fortran_files: Vec<String> },
-    Translate {
-        fortran_files: Vec<String>,
-        seed_prompt: String,
-        model: Option<String>,
-    },
-    Generate {
-        seed_prompt: String,
-        model: Option<String>,
-        reference_existing: Vec<String>,
-    },
-    Update {
-        filelist: Vec<String>,
-        seed_prompt: String,
-        model: String,
-        reference_existing: Vec<String>,
-    },
-    Inspect {
-        fortran_files: Vec<String>,
-        query_prompt: String,
-        model: Option<String>,
-    },
-    Format { seed_prompt_list: Vec<String> },
-}
+use cli::Cli;
+use loop_runner::{PromptLoopRunner, RunnerConfig};
 
 fn main() {
     let cli = Cli::parse();
+    let logging = cli::resolve_logging(cli.log_enabled, cli.log_path);
 
-    match cli.command {
-        Commands::Index { root_dir } => index(root_dir),
-        Commands::Draft { fortran_files } => draft(fortran_files),
-        Commands::Translate {
-            fortran_files,
-            seed_prompt,
-            model,
-        } => translate(fortran_files, seed_prompt, model),
-        Commands::Generate {
-            seed_prompt,
-            model,
-            reference_existing,
-        } => generate(seed_prompt, model, reference_existing),
-        Commands::Update {
-            filelist,
-            seed_prompt,
-            model,
-            reference_existing,
-        } => update(filelist, seed_prompt, model, reference_existing),
-        Commands::Inspect {
-            fortran_files,
-            query_prompt,
-            model,
-        } => inspect(fortran_files, query_prompt, model),
-        Commands::Format { seed_prompt_list } => format(seed_prompt_list),
+    let cfg = RunnerConfig {
+        task_file: cli.task_file,
+        model: cli.model,
+        agent_loops: cli.agent_loops,
+        agent_iterations: cli.agent_iterations,
+        verbose: cli.verbose,
+        logging,
+        workdir: cli.workdir,
+        reason: cli.reason,
+    };
+
+    let result = PromptLoopRunner::new(cfg).and_then(|mut runner| runner.run());
+
+    match result {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
     }
 }

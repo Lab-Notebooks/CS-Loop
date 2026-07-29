@@ -1,0 +1,900 @@
+//! Filesystem + shell tools for the coding agent.
+//!
+//! Ports `codescribe/lib/_tools.py`.
+
+use std::collections::HashSet;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context};
+
+pub trait AgentTool {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn parameters(&self) -> &serde_json::Value;
+    fn enabled(&self) -> bool;
+    // Backs Agent::enable_tool/disable_tool, which are themselves unused today — kept
+    // for API-shape completeness matching `_tools.py`'s `AgentTool`.
+    #[allow(dead_code)]
+    fn set_enabled(&mut self, v: bool);
+    /// Never panics; failures are returned as `"Error: ..."` strings (matches the
+    /// Python convention so `is_error_output` detection in `agent.rs` keeps working).
+    fn run(&self, args: &serde_json::Value) -> String;
+
+    fn to_openai_tool(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": self.parameters(),
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path containment
+// ---------------------------------------------------------------------------
+
+/// Resolve `path` the way Python's `Path.resolve()` does: normalize `.`/`..` and follow
+/// symlinks in whatever prefix exists, but tolerate a nonexistent final component (needed
+/// so `write` can target a brand-new file). `std::fs::canonicalize` alone can't do this —
+/// it hard-errors on any missing path component.
+fn lexical_resolve(path: &Path) -> std::io::Result<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match existing.file_name() {
+            Some(name) => suffix.push(name.to_os_string()),
+            None => break,
+        }
+        if !existing.pop() {
+            break;
+        }
+    }
+    let mut resolved = existing.canonicalize()?;
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved)
+}
+
+pub fn resolve_within_root(root: &Path, target: &str) -> anyhow::Result<PathBuf> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("root does not exist: {}", root.display()))?;
+    let candidate = Path::new(target);
+    let candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let resolved =
+        lexical_resolve(&candidate).map_err(|_| anyhow!("Path escapes working directory: {target}"))?;
+    if !resolved.starts_with(&root) {
+        bail!("Path escapes working directory: {target}");
+    }
+    Ok(resolved)
+}
+
+// ---------------------------------------------------------------------------
+// ReadTool
+// ---------------------------------------------------------------------------
+
+pub struct ReadTool {
+    root: Option<PathBuf>,
+    enabled: bool,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+fn split_keepends(s: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for c in s.chars() {
+        current.push(c);
+        if c == '\n' {
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+impl ReadTool {
+    pub fn new(root: Option<PathBuf>) -> Self {
+        let mut desc = "Read a text file. Supports optional 1-indexed offset and line limit. \
+                         By default, prefixes each returned line with a 1-indexed line number."
+            .to_string();
+        if root.is_some() {
+            desc.push_str(" Access is restricted to the working directory tree.");
+        }
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to the file to read."},
+                "offset": {"type": "integer", "description": "1-indexed starting line number.", "minimum": 1},
+                "limit": {"type": "integer", "description": "Maximum number of lines to read.", "minimum": 1},
+                "with_line_numbers": {"type": "integer", "description": "Set to 1 (default) to prefix each returned line with its line number; 0 to return raw text."}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        Self { root, enabled: true, description: desc, parameters }
+    }
+}
+
+impl AgentTool for ReadTool {
+    fn name(&self) -> &str {
+        "read"
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        &self.parameters
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, v: bool) {
+        self.enabled = v;
+    }
+
+    fn run(&self, args: &serde_json::Value) -> String {
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return "Error: missing required argument 'path'".to_string(),
+        };
+        let offset = args.get("offset").and_then(|v| v.as_i64());
+        let limit = args.get("limit").and_then(|v| v.as_i64());
+        let with_line_numbers = args.get("with_line_numbers").and_then(|v| v.as_i64()).unwrap_or(1) != 0;
+
+        let resolved: PathBuf = if let Some(root) = &self.root {
+            match resolve_within_root(root, path) {
+                Ok(p) => p,
+                Err(e) => return format!("Error: {e}"),
+            }
+        } else {
+            PathBuf::from(path)
+        };
+
+        if !resolved.exists() {
+            return format!("Error: file not found: {}", resolved.display());
+        }
+        if !resolved.is_file() {
+            return format!("Error: not a file: {}", resolved.display());
+        }
+
+        let bytes = match std::fs::read(&resolved) {
+            Ok(b) => b,
+            Err(e) => return format!("Error: {e}"),
+        };
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        let lines = split_keepends(&content);
+
+        let start = (offset.unwrap_or(1).max(1) - 1) as usize;
+        if start >= lines.len() {
+            return String::new();
+        }
+        let end_unclamped = match limit {
+            Some(l) => start + (l.max(1) as usize),
+            None => lines.len(),
+        };
+        let end_clamped = end_unclamped.min(lines.len());
+        let chunk = &lines[start..end_clamped];
+        if chunk.is_empty() {
+            return String::new();
+        }
+
+        if !with_line_numbers {
+            return chunk.concat();
+        }
+
+        let width = std::cmp::max(4, end_unclamped.to_string().len());
+        let header = format!(
+            "# path: {}\n# lines: {}-{}\n",
+            resolved.display(),
+            start + 1,
+            end_clamped
+        );
+        let mut numbered = String::new();
+        for (i, line) in chunk.iter().enumerate() {
+            numbered.push_str(&format!("{:0width$}: {line}", start + i + 1, width = width));
+        }
+        header + &numbered
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GlobTool
+// ---------------------------------------------------------------------------
+
+pub struct GlobTool {
+    root: Option<PathBuf>,
+    enabled: bool,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+impl GlobTool {
+    pub fn new(root: Option<PathBuf>) -> Self {
+        let mut desc = "List files matching a glob pattern (e.g. '**/*.py'). \
+                         Returns newline-separated paths (relative to root when bounded)."
+            .to_string();
+        if root.is_some() {
+            desc.push_str(" Access is restricted to the working directory tree.");
+        }
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern (supports **)."},
+                "root": {"type": "string", "description": "Optional root directory for the search (default: current/bounded root)."},
+                "include_dirs": {"type": "integer", "description": "Set to 1 to include directories; 0/omitted to include only files."},
+                "limit": {"type": "integer", "description": "Maximum number of results to return.", "minimum": 1}
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        });
+        Self { root, enabled: true, description: desc, parameters }
+    }
+}
+
+impl AgentTool for GlobTool {
+    fn name(&self) -> &str {
+        "glob"
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        &self.parameters
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, v: bool) {
+        self.enabled = v;
+    }
+
+    fn run(&self, args: &serde_json::Value) -> String {
+        let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return "Error: missing required argument 'pattern'".to_string(),
+        };
+        let root_arg = args.get("root").and_then(|v| v.as_str());
+        let include_dirs = args.get("include_dirs").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(2000).max(1) as usize;
+
+        let base: PathBuf = if let Some(root) = &self.root {
+            match root_arg {
+                Some(r) => match resolve_within_root(root, r) {
+                    Ok(p) => p,
+                    Err(e) => return format!("Error: {e}"),
+                },
+                None => root.clone(),
+            }
+        } else {
+            match root_arg {
+                Some(r) => match Path::new(r).canonicalize() {
+                    Ok(p) => p,
+                    Err(e) => return format!("Error: {e}"),
+                },
+                None => std::env::current_dir().unwrap_or_default(),
+            }
+        };
+
+        let pattern_path = base.join(pattern);
+        let entries = match glob::glob(&pattern_path.to_string_lossy()) {
+            Ok(paths) => paths,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for entry in entries {
+            let p = match entry {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let p = if let Some(root) = &self.root {
+                match resolve_within_root(root, &p.to_string_lossy()) {
+                    Ok(pp) => pp,
+                    Err(_) => continue,
+                }
+            } else {
+                match p.canonicalize() {
+                    Ok(pp) => pp,
+                    Err(_) => continue,
+                }
+            };
+            if !include_dirs && p.is_dir() {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(&base)
+                .map(|r| r.to_string_lossy().to_string())
+                .unwrap_or_else(|_| p.to_string_lossy().to_string());
+            out.insert(rel);
+        }
+
+        let mut out: Vec<String> = out.into_iter().collect();
+        out.truncate(limit);
+        out.join("\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BashTool
+// ---------------------------------------------------------------------------
+
+// Newline/carriage-return are deliberately included (a fix vs. the Python reference,
+// which omits them): `validate_command` only inspects the FIRST shell token via
+// `shell_words::split`, which tokenizes across newlines as if they were plain
+// whitespace. Without blocking them here, a command like "ls\nrm -rf /" passes the
+// allowlist check (first token "ls" is allowed) but `bash -c` still executes both
+// lines as separate statements — a command-injection bypass of the allowlist itself.
+const BLOCKED_CHARS: &[char] = &['|', '&', ';', '>', '<', '`', '$', '\n', '\r'];
+
+pub fn default_allowed_commands() -> HashSet<String> {
+    ["ls", "pwd", "find", "grep", "head", "tail", "wc", "git", "test", "echo", "sed"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+pub struct BashTool {
+    cwd: Option<PathBuf>,
+    bounded: bool,
+    allowed_commands: HashSet<String>,
+    enabled: bool,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+fn run_with_timeout(
+    mut child: std::process::Child,
+    timeout: Option<Duration>,
+) -> std::io::Result<std::process::Output> {
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let status = match timeout {
+        None => child.wait()?,
+        Some(dur) => {
+            let start = std::time::Instant::now();
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if start.elapsed() >= dur {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "command timed out"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
+impl BashTool {
+    pub fn new(cwd: Option<PathBuf>, bounded: bool, allowed_commands: Option<HashSet<String>>) -> Self {
+        let allowed_commands = allowed_commands.unwrap_or_else(default_allowed_commands);
+        let mut desc = "Execute a bash command in the current working directory.".to_string();
+        if cwd.is_some() {
+            desc.push_str(
+                " Commands execute with the working directory set to the bounded root.\
+                 Only access files and paths within the working directory;\
+                 do not navigate to or read from paths outside it.",
+            );
+        }
+        if bounded {
+            desc.push_str(" Potentially-dangerous shell syntax is blocked (pipes, redirects, $(), etc).");
+            let mut allowed: Vec<&str> = allowed_commands.iter().map(|s| s.as_str()).collect();
+            allowed.sort_unstable();
+            desc.push_str(&format!(" Allowed commands: {}.", allowed.join(", ")));
+        }
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Bash command to execute."},
+                "timeout": {"type": "integer", "description": "Optional timeout in seconds.", "minimum": 1}
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        });
+        Self { cwd, bounded, allowed_commands, enabled: true, description: desc, parameters }
+    }
+
+    fn validate_command(&self, command: &str) -> Option<String> {
+        if !self.bounded {
+            return None;
+        }
+        if command.chars().any(|c| BLOCKED_CHARS.contains(&c)) {
+            return Some("blocked shell syntax detected".to_string());
+        }
+        let parts = match shell_words::split(command) {
+            Ok(p) => p,
+            Err(_) => return Some("could not parse command".to_string()),
+        };
+        let exe = match parts.first() {
+            Some(e) => e,
+            None => return Some("empty command".to_string()),
+        };
+        if !self.allowed_commands.contains(exe.as_str()) {
+            return Some(format!("command not allowed: {exe:?}"));
+        }
+        None
+    }
+}
+
+impl AgentTool for BashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        &self.parameters
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, v: bool) {
+        self.enabled = v;
+    }
+
+    fn run(&self, args: &serde_json::Value) -> String {
+        let command = match args.get("command").and_then(|v| v.as_str()) {
+            Some(c) if !c.is_empty() => c,
+            _ => return "Error: missing required argument 'command'".to_string(),
+        };
+        if let Some(err) = self.validate_command(command) {
+            return format!("Error: {err}");
+        }
+        let timeout = args
+            .get("timeout")
+            .and_then(|v| v.as_i64())
+            .map(|t| Duration::from_secs(t.max(0) as u64));
+
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c").arg(command);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let output = match run_with_timeout(child, timeout) {
+            Ok(o) => o,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        let mut out = format!("exit_code: {code}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        while out.ends_with(['\n', '\r', ' ', '\t']) {
+            out.pop();
+        }
+        out.push('\n');
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EditTool
+// ---------------------------------------------------------------------------
+
+pub struct EditTool {
+    root: Option<PathBuf>,
+    enabled: bool,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+impl EditTool {
+    pub fn new(root: Option<PathBuf>) -> Self {
+        let mut desc = "Edit a file using exact text replacements (all oldText must match exactly once).".to_string();
+        if root.is_some() {
+            desc.push_str(" Access is restricted to the working directory tree.");
+        }
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to the file to edit."},
+                "edits": {
+                    "type": "array",
+                    "description": "List of replacements.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "oldText": {"type": "string"},
+                            "newText": {"type": "string"}
+                        },
+                        "required": ["oldText", "newText"],
+                        "additionalProperties": false
+                    },
+                    "minItems": 1
+                }
+            },
+            "required": ["path", "edits"],
+            "additionalProperties": false
+        });
+        Self { root, enabled: true, description: desc, parameters }
+    }
+
+    /// Compact snippet around a [start:end] char range, matching `EditTool.snippet`.
+    fn snippet(text: &str, start: usize, end: usize, context: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let left = start.saturating_sub(context);
+        let right = (end + context).min(chars.len());
+        let prefix = if left > 0 { "…" } else { "" };
+        let suffix = if right < chars.len() { "…" } else { "" };
+        let body: String = chars[left..right].iter().collect();
+        format!("{prefix}{body}{suffix}")
+    }
+}
+
+struct Replacement {
+    index: usize,
+    match_count: usize,
+    old_len_chars: usize,
+    new_len_chars: usize,
+    before_snippet: String,
+    old_text: String,
+    new_text: String,
+}
+
+impl AgentTool for EditTool {
+    fn name(&self) -> &str {
+        "edit"
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        &self.parameters
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, v: bool) {
+        self.enabled = v;
+    }
+
+    fn run(&self, args: &serde_json::Value) -> String {
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return "Error: missing required argument 'path'".to_string(),
+        };
+        let edits = match args.get("edits").and_then(|v| v.as_array()) {
+            Some(e) if !e.is_empty() => e,
+            _ => return "Error: missing required argument 'edits'".to_string(),
+        };
+
+        let resolved = if let Some(root) = &self.root {
+            match resolve_within_root(root, path) {
+                Ok(p) => p,
+                Err(e) => return format!("Error: {e}"),
+            }
+        } else {
+            PathBuf::from(path)
+        };
+
+        if !resolved.exists() {
+            return format!("Error: file not found: {}", resolved.display());
+        }
+        if !resolved.is_file() {
+            return format!("Error: not a file: {}", resolved.display());
+        }
+
+        let content_before = match std::fs::read_to_string(&resolved) {
+            Ok(c) => c,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let mut replacements: Vec<Replacement> = Vec::new();
+        for (idx, e) in edits.iter().enumerate() {
+            let (old, new) = match (
+                e.get("oldText").and_then(|v| v.as_str()),
+                e.get("newText").and_then(|v| v.as_str()),
+            ) {
+                (Some(o), Some(n)) => (o, n),
+                _ => return "Error: each edit must include oldText and newText".to_string(),
+            };
+
+            let count = content_before.matches(old).count();
+            if count != 1 {
+                return format!("Error: oldText must match exactly once; found {count} matches for: {old:?}");
+            }
+            let byte_start = content_before.find(old).unwrap();
+            let byte_end = byte_start + old.len();
+            let char_start = content_before[..byte_start].chars().count();
+            let char_end = content_before[..byte_end].chars().count();
+            replacements.push(Replacement {
+                index: idx,
+                match_count: count,
+                old_len_chars: old.chars().count(),
+                new_len_chars: new.chars().count(),
+                before_snippet: Self::snippet(&content_before, char_start, char_end, 80),
+                old_text: old.to_string(),
+                new_text: new.to_string(),
+            });
+        }
+
+        let mut content_after = content_before;
+        for r in &replacements {
+            content_after = content_after.replace(&r.old_text, &r.new_text);
+        }
+
+        if let Err(e) = std::fs::write(&resolved, &content_after) {
+            return format!("Error: {e}");
+        }
+
+        let mut applied = Vec::new();
+        for r in &replacements {
+            let after_snippet = if let Some(byte_pos) = content_after.find(&r.new_text) {
+                let char_pos = content_after[..byte_pos].chars().count();
+                let char_end = char_pos + r.new_text.chars().count();
+                Self::snippet(&content_after, char_pos, char_end, 80)
+            } else {
+                "(newText not found after write)".to_string()
+            };
+            applied.push(serde_json::json!({
+                "index": r.index,
+                "match_count": r.match_count,
+                "old_len": r.old_len_chars,
+                "new_len": r.new_len_chars,
+                "before_snippet": r.before_snippet,
+                "after_snippet": after_snippet,
+            }));
+        }
+
+        let report = serde_json::json!({
+            "ok": true,
+            "path": resolved.display().to_string(),
+            "applied": replacements.len(),
+            "replacements": applied,
+        });
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "Error: failed to serialize report".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WriteTool
+// ---------------------------------------------------------------------------
+
+pub struct WriteTool {
+    root: Option<PathBuf>,
+    enabled: bool,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+impl WriteTool {
+    pub fn new(root: Option<PathBuf>) -> Self {
+        let mut desc = "Write a file (create or overwrite).".to_string();
+        if root.is_some() {
+            desc.push_str(" Access is restricted to the working directory tree.");
+        }
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to write."},
+                "content": {"type": "string", "description": "Full content to write."}
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        });
+        Self { root, enabled: true, description: desc, parameters }
+    }
+}
+
+impl AgentTool for WriteTool {
+    fn name(&self) -> &str {
+        "write"
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        &self.parameters
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, v: bool) {
+        self.enabled = v;
+    }
+
+    fn run(&self, args: &serde_json::Value) -> String {
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return "Error: missing required argument 'path'".to_string(),
+        };
+        let content = match args.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => return "Error: missing required argument 'content'".to_string(),
+        };
+
+        let resolved = if let Some(root) = &self.root {
+            match resolve_within_root(root, path) {
+                Ok(p) => p,
+                Err(e) => return format!("Error: {e}"),
+            }
+        } else {
+            PathBuf::from(path)
+        };
+
+        if let Some(parent) = resolved.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return format!("Error: {e}");
+            }
+        }
+        match std::fs::write(&resolved, content) {
+            Ok(()) => format!("Wrote {} ({} bytes)", resolved.display(), content.len()),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Factories
+// ---------------------------------------------------------------------------
+
+pub fn make_tools(root: &Path, bash_allow: &HashSet<String>) -> Vec<Box<dyn AgentTool>> {
+    let mut allowed = default_allowed_commands();
+    allowed.extend(bash_allow.iter().cloned());
+    vec![
+        Box::new(ReadTool::new(Some(root.to_path_buf()))),
+        Box::new(GlobTool::new(Some(root.to_path_buf()))),
+        Box::new(BashTool::new(Some(root.to_path_buf()), true, Some(allowed))),
+        Box::new(EditTool::new(Some(root.to_path_buf()))),
+        Box::new(WriteTool::new(Some(root.to_path_buf()))),
+    ]
+}
+
+// Ported for parity with `_tools.py::make_readonly_tools` (used there by the
+// read-only `inspect` command, which is out of scope for the loop-only csloop binary).
+#[allow(dead_code)]
+pub fn make_readonly_tools(root: &Path, bash_allow: &HashSet<String>) -> Vec<Box<dyn AgentTool>> {
+    let mut allowed = default_allowed_commands();
+    allowed.extend(bash_allow.iter().cloned());
+    vec![
+        Box::new(ReadTool::new(Some(root.to_path_buf()))),
+        Box::new(GlobTool::new(Some(root.to_path_buf()))),
+        Box::new(BashTool::new(Some(root.to_path_buf()), true, Some(allowed))),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("csloop_test_{tag}_{nanos}"))
+    }
+
+    #[test]
+    fn bash_blocks_newline_command_injection() {
+        // Regression test for a command-injection bypass: validate_command only
+        // inspects the FIRST shell token, so without blocking newlines a string like
+        // "ls\nrm -rf /" would pass the allowlist check (first token "ls" is allowed)
+        // while `bash -c` still executes the second line unchecked.
+        let allow: HashSet<String> = ["ls"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "ls\ntouch /tmp/csloop_should_not_run_marker"}));
+        assert!(out.starts_with("Error:"), "expected newline-injected command to be rejected, got: {out}");
+        assert!(!std::path::Path::new("/tmp/csloop_should_not_run_marker").exists());
+    }
+
+    #[test]
+    fn bash_allows_single_allowed_command() {
+        let allow: HashSet<String> = ["echo"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "echo hi"}));
+        assert!(!out.starts_with("Error:"), "unexpected error: {out}");
+        assert!(out.contains("hi"));
+    }
+
+    #[test]
+    fn bash_rejects_disallowed_command() {
+        let allow: HashSet<String> = ["ls"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "cat /etc/passwd"}));
+        assert!(out.starts_with("Error:"));
+    }
+
+    #[test]
+    fn bash_blocks_pipe_and_substitution_syntax() {
+        let allow: HashSet<String> = ["echo"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(allow));
+        for cmd in ["echo hi | cat", "echo $(whoami)", "echo `whoami`", "echo hi; whoami"] {
+            let out = tool.run(&serde_json::json!({"command": cmd}));
+            assert!(out.starts_with("Error:"), "expected {cmd:?} to be rejected, got: {out}");
+        }
+    }
+
+    #[test]
+    fn edit_requires_exactly_one_match() {
+        let dir = unique_test_dir("edit_ambiguous");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "aa").unwrap();
+        let tool = EditTool::new(Some(dir.clone()));
+        let out = tool.run(&serde_json::json!({
+            "path": "f.txt",
+            "edits": [{"oldText": "a", "newText": "b"}]
+        }));
+        assert!(out.starts_with("Error:"), "expected ambiguous match to error, got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_applies_unique_match() {
+        let dir = unique_test_dir("edit_unique");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let tool = EditTool::new(Some(dir.clone()));
+        let out = tool.run(&serde_json::json!({
+            "path": "f.txt",
+            "edits": [{"oldText": "world", "newText": "there"}]
+        }));
+        assert!(!out.starts_with("Error:"), "unexpected error: {out}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello there");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_within_root_blocks_escape() {
+        let dir = unique_test_dir("root_escape");
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = resolve_within_root(&dir, "../../etc/passwd");
+        assert!(result.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_within_root_allows_new_file() {
+        let dir = unique_test_dir("root_new_file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = resolve_within_root(&dir, "brand_new_file.txt");
+        assert!(result.is_ok(), "should allow resolving a path to a not-yet-existing file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
