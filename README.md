@@ -7,7 +7,7 @@ with CodeScribe (https://github.com/Lab-Notebooks/CodeScribe)
 ## Install
 
 ```sh
-cargo install --git https://github.com/Lab-Notebooks/csloop
+cargo install --git https://github.com/Lab-Notebooks/CS-Loop
 ```
 
 This builds and installs the `csloop` binary to `~/.cargo/bin` — no source checkout is
@@ -19,7 +19,7 @@ Useful if the repository is private or you'd rather authenticate with your SSH k
 an HTTPS credential helper:
 
 ```sh
-cargo install --git ssh://git@github.com/Lab-Notebooks/csloop.git
+cargo install --git ssh://git@github.com/Lab-Notebooks/CS-Loop.git
 ```
 
 Cargo's built-in git support requires the full `ssh://` form — the scp-like shorthand
@@ -47,9 +47,9 @@ export CARGO_NET_GIT_FETCH_WITH_CLI=true
 latest commit on the default branch with `--force`:
 
 ```sh
-cargo install --force --git https://github.com/Lab-Notebooks/csloop
+cargo install --force --git https://github.com/Lab-Notebooks/CS-Loop
 # or, over SSH:
-cargo install --force --git ssh://git@github.com/Lab-Notebooks/csloop.git
+cargo install --force --git ssh://git@github.com/Lab-Notebooks/CS-Loop.git
 ```
 
 Check what's currently installed with:
