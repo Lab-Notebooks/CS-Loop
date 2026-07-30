@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "csloop"
-version = "0.1.0"
+version = "2026.07"
 dependencies = [
  "anyhow",
  "clap",

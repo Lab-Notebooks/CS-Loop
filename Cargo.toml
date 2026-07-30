@@ -1,8 +1,8 @@
 [package]
 name = "csloop"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+version = "2026.07"
+edition = "2024"
+license = "GPL-3.0-only"
 description = "Bounded author/review agent loop against Anthropic models"
 repository = "https://github.com/Lab-Notebooks/csloop"
 
