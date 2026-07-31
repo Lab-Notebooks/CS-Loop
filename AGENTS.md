@@ -6,41 +6,27 @@ in the legend at the end.
 
 ```mermaid
 flowchart TD
-    INTAKE(["Intake\nCLI args + task file"]) --> START((start))
-    START --> AUTHOR
+    INTAKE(["Intake<br/>CLI args + task file"]) --> LOOP
 
     subgraph LOOP["LOOP — bounded, 1..max_loops"]
-        direction LR
-        AUTHOR[["AUTHOR phase\nread · glob · edit · write · shell"]]
-        REVIEWER[["REVIEWER phase\nread · glob · write · read-only shell"]]
+        AUTHOR[["AUTHOR phase<br/>read · glob · edit · write · shell"]]
+        REVIEWER[["REVIEWER phase<br/>read · glob · write · read-only shell"]]
         AUTHOR -- "summary + pending" --> REVIEWER
         REVIEWER -- "pending items" --> AUTHOR
     end
 
-    AUTHOR -- "done" --> EXIT((exit loop))
-    REVIEWER -- "clean" --> EXIT
-    LOOP -. "max_loops reached\n(partial completion)" .-> EXIT
+    LOOP -- "author done, reviewer clean,<br/>or max_loops reached" --> EXIT((exit loop))
+    LOOP -- "each phase runs one" --> SESSION
 
-    AUTHOR -. runs .-> SESSION
-    REVIEWER -. runs .-> SESSION
-
-    subgraph SESSION["AGENT SESSION — bounded, 1..max_iterations (same engine, either role)"]
-        direction TB
-        ITER["Iteration\nconversation + tool schemas"] --> GATEWAY["Model Gateway\nprovider adapter"]
-        GATEWAY <--> MODEL[("Model\n(LLM)")]
-        GATEWAY -- "tool call(s)" --> SANDBOX["Tool Sandbox\nvalidate → path-check →\nallowlist → execute → truncate"]
+    subgraph SESSION["AGENT SESSION — bounded, 1..max_iterations"]
+        ITER["Iteration<br/>conversation + tool schemas"] --> GATEWAY["Model Gateway<br/>provider adapter"]
+        GATEWAY <--> MODEL[("Model<br/>(LLM)")]
+        GATEWAY -- "tool call(s)" --> SANDBOX["Tool Sandbox<br/>validate → allowlist → execute"]
         SANDBOX -- "result" --> ITER
         GATEWAY -- "text only" --> FINAL(["final answer"])
-        GATEWAY -- "empty, twice in a row" --> STOPPED(["stopped, not finished"])
     end
 
-    EXIT --> RETURN(["Return path\nsuccess / failure"])
-
-    PERSIST[("Persistence & Observability\nrun/loop state · event log")]
-    INTAKE -.-> PERSIST
-    AUTHOR -.-> PERSIST
-    REVIEWER -.-> PERSIST
-    SESSION -.-> PERSIST
+    EXIT --> RETURN(["Return path<br/>success / failure"])
 ```
 
 ## Notes the diagram can't show
@@ -52,6 +38,8 @@ flowchart TD
 - Persistence (run/loop state, per-phase metadata, event log) is written
   incrementally beside every stage, not after — a run stays
   inspectable/resumable even if the process dies mid-way.
+- If the model returns no tool calls and no text twice in a row, the agent
+  session ends as "stopped, not finished" rather than spinning.
 
 ## One invariant worth knowing
 
