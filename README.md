@@ -64,7 +64,8 @@ cargo install --list | grep csloop
 ## Usage
 
 ```sh
-export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_BASE_URL="http://..."
+export ANTHROPIC_API_KEY="sk-ant-..."
 
 csloop <task_file> -m <model> [OPTIONS]
 ```
