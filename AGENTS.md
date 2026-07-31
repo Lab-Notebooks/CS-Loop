@@ -1,93 +1,57 @@
 # Processing Pipeline
 
-How a task flows through the system, top to bottom: **Loop → Agent Session →
-Model Gateway → Model**, with a **Tool Sandbox** gating every tool call.
-Source locations are in the legend at the end.
+How a task flows through the system: **Loop → Agent Session → Model Gateway →
+Model**, with a **Tool Sandbox** gating every tool call. Source locations are
+in the legend at the end.
 
-```text
-┌──────────────────────────────── INTAKE (once) ─────────────────────────────────┐
-│ CLI args + task file → validate → resolve sandbox root → create run/loop dir   │
-└──────────────────────────────────────────┬─────────────────────────────────────┘
-                                            ▼
-╔══════════════════════════════════ LOOP  (1..max_loops) ════════════════════════╗
-║                                                                                  ║
-║   ┌───────────────┐   summary +    ┌────────────────┐                          ║
-║   │    AUTHOR     │───────────────▶│    REVIEWER     │                         ║
-║   │    phase      │   pending      │    phase        │                         ║
-║   └───────┬───────┘                └────────┬────────┘                         ║
-║           │                                  │                                  ║
-║      done?├── yes ──▶ EXIT LOOP        clean?├── yes ──▶ EXIT LOOP             ║
-║           │no                                 │no (pending items / blocker)     ║
-║           ▼                                   ▼                                 ║
-║      next loop  ◀─────── pending items feed next AUTHOR prompt ─────────────────║
-║                                                                                  ║
-║   neither role can force extra loops — after max_loops the controller stops     ║
-║   and reports partial completion, it never spins forever                       ║
-╚═══════════════════════════════════════════╤════════════════════════════════════╝
-                          author & reviewer are the SAME engine, different toolsets
-                                             ▼
-┌─────────────────────────── AGENT SESSION  (1..max_iterations) ─────────────────┐
-│                                                                                  │
-│    ┌─────────────────────────── ITERATION ──────────────────────────────────┐  │
-│    │  conversation + tool schemas                                           │  │
-│    │             │                                                          │  │
-│    │             ▼                                                          │  │
-│    │      ┌───────────────┐   request    ┌───────────┐                     │  │
-│    │      │ MODEL GATEWAY │─────────────▶│   MODEL   │                     │  │
-│    │      │ (provider     │◀─────────────│  (LLM)    │                     │  │
-│    │      │  adapter)     │   response    └───────────┘                     │  │
-│    │      └───────┬───────┘                                                 │  │
-│    │              │                                                         │  │
-│    │     tool call(s)? ── no, text only ──▶ FINAL ANSWER → end session      │  │
-│    │              │ yes                     empty reply ──▶ nudge once,    │  │
-│    │              ▼                         then end "not finished"        │  │
-│    │      ┌───────────────┐                                                │  │
-│    │      │ TOOL SANDBOX  │  (see below — runs once per call)              │  │
-│    │      └───────┬───────┘                                                │  │
-│    │              │ result appended to conversation                        │  │
-│    │              └────────────────────────▶ next ITERATION                │  │
-│    └─────────────────────────────────────────────────────────────────────-─┘  │
-│                                                                                  │
-│   repeated-error streak → nudge to stop retrying & report the blocker          │
-│   hard call-budget ceiling → stops the session even mid-conversation           │
-└──────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    INTAKE(["Intake\nCLI args + task file"]) --> START((start))
+    START --> AUTHOR
 
-┌────────────────────── TOOL SANDBOX  (model input = untrusted) ─────────────────┐
-│ reject unknown/disabled tool → validate args vs schema → repeated-call guard    │
-│ → path containment (files AND shell-arg paths, symlink/`..`-safe) → shell      │
-│ allowlist (no chaining metacharacters; dangerous flags rejected; one program   │
-│ always forced into its safe mode) → execute w/ timeout → truncate + classify   │
-│ success/error → NEVER crashes the session, always degrades to an error string  │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                             │
-                                             ▼
-┌───────────────────────────────── RETURN PATH ──────────────────────────────────┐
-│  success → one-line summary (loops used, run id, artifact dir)                │
-│  failure → formatted error + non-zero exit — no partial/ambiguous state        │
-└──────────────────────────────────────────────────────────────────────────────┘
+    subgraph LOOP["LOOP — bounded, 1..max_loops"]
+        direction LR
+        AUTHOR[["AUTHOR phase\nread · glob · edit · write · shell"]]
+        REVIEWER[["REVIEWER phase\nread · glob · write · read-only shell"]]
+        AUTHOR -- "summary + pending" --> REVIEWER
+        REVIEWER -- "pending items" --> AUTHOR
+    end
+
+    AUTHOR -- "done" --> EXIT((exit loop))
+    REVIEWER -- "clean" --> EXIT
+    LOOP -. "max_loops reached\n(partial completion)" .-> EXIT
+
+    AUTHOR -. runs .-> SESSION
+    REVIEWER -. runs .-> SESSION
+
+    subgraph SESSION["AGENT SESSION — bounded, 1..max_iterations (same engine, either role)"]
+        direction TB
+        ITER["Iteration\nconversation + tool schemas"] --> GATEWAY["Model Gateway\nprovider adapter"]
+        GATEWAY <--> MODEL[("Model\n(LLM)")]
+        GATEWAY -- "tool call(s)" --> SANDBOX["Tool Sandbox\nvalidate → path-check →\nallowlist → execute → truncate"]
+        SANDBOX -- "result" --> ITER
+        GATEWAY -- "text only" --> FINAL(["final answer"])
+        GATEWAY -- "empty, twice in a row" --> STOPPED(["stopped, not finished"])
+    end
+
+    EXIT --> RETURN(["Return path\nsuccess / failure"])
+
+    PERSIST[("Persistence & Observability\nrun/loop state · event log")]
+    INTAKE -.-> PERSIST
+    AUTHOR -.-> PERSIST
+    REVIEWER -.-> PERSIST
+    SESSION -.-> PERSIST
 ```
 
-## AUTHOR vs. REVIEWER toolsets
+## Notes the diagram can't show
 
-```
- AUTHOR                          REVIEWER
- ───────────────────────         ───────────────────────
- read · glob · edit · write      read · glob · write  (no edit)
- shell: broad inspection         shell: read-only inspection only,
-        allowlist                        env-dumping commands excluded
- goal: make progress             goal: pending items[] + optional blocker,
-                                        written as a structured verdict file
-```
-
-If the reviewer's verdict file is empty/unwritten, the loop treats it as
-**inconclusive** and continues rather than failing.
-
-## Cross-cutting: persistence & observability
-
-Runs beside every stage, not after it — run/loop state, per-phase metadata,
-and an append-only event log are written incrementally so a run stays
-inspectable/resumable even if the process dies mid-way. An optional console
-reporter mirrors this live.
+- The reviewer's job is to write a structured verdict (pending items +
+  optional blocker), not free text. If that file comes back empty/unwritten,
+  the loop treats the round as **inconclusive** and continues rather than
+  failing.
+- Persistence (run/loop state, per-phase metadata, event log) is written
+  incrementally beside every stage, not after — a run stays
+  inspectable/resumable even if the process dies mid-way.
 
 ## One invariant worth knowing
 
