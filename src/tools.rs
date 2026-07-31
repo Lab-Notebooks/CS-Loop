@@ -416,6 +416,31 @@ impl BashTool {
             let mut allowed: Vec<&str> = allowed_commands.iter().map(|s| s.as_str()).collect();
             allowed.sort_unstable();
             desc.push_str(&format!(" Allowed commands: {}.", allowed.join(", ")));
+
+            // Surfaced up front so the model doesn't burn iterations discovering these
+            // by trial and error: each restriction below is enforced in validate_command
+            // / harden_command, not just documented here.
+            let mut caveats: Vec<&str> = Vec::new();
+            if allowed_commands.contains("find") || allowed_commands.contains("bfs") || allowed_commands.contains("gfind")
+            {
+                caveats.push(
+                    "find: -exec/-execdir/-ok/-okdir are rejected (they run an arbitrary program per match); \
+                     use find only to locate paths, then act on results with other tools.",
+                );
+            }
+            if allowed_commands.contains("rg") {
+                caveats.push("rg: --pre/--pre-glob are rejected (they run an arbitrary preprocessor per file).");
+            }
+            if allowed_commands.contains("sed") {
+                caveats.push(
+                    "sed: always runs with --sandbox enforced, so e/w/r commands \
+                     (e.g. '1e cmd', 's/x/y/e') are disabled; use sed only for text substitution.",
+                );
+            }
+            if !caveats.is_empty() {
+                desc.push(' ');
+                desc.push_str(&caveats.join(" "));
+            }
         }
         let parameters = serde_json::json!({
             "type": "object",
@@ -447,7 +472,58 @@ impl BashTool {
         if !self.allowed_commands.contains(exe.as_str()) {
             return Some(format!("command not allowed: {exe:?}"));
         }
+
+        // Allowlisting the executable name isn't enough on its own: `find`/`bfs` and
+        // `rg` have built-in flags that spawn an arbitrary program per matched file,
+        // fully bypassing the allowlist without needing any of the blocked shell
+        // metacharacters above. Reject those flags outright — there's no legitimate
+        // use of them for a read-only search/inspection tool.
+        if (exe == "find" || exe == "bfs" || exe == "gfind")
+            && let Some(bad) =
+                parts[1..].iter().find(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+        {
+            return Some(format!("disallowed {exe} flag {bad:?}: spawns an arbitrary program per match"));
+        }
+        if exe == "rg"
+            && parts[1..]
+                .iter()
+                .any(|a| a == "--pre" || a == "--pre-glob" || a.starts_with("--pre=") || a.starts_with("--pre-glob="))
+        {
+            return Some("disallowed rg flag --pre/--pre-glob: spawns an arbitrary preprocessor program".to_string());
+        }
+
+        // `current_dir` alone only bounds where the process starts, not what its
+        // arguments point at (e.g. `grep secret /etc/passwd`, `find / -name id_rsa`
+        // would otherwise read anywhere the OS user can). Reject any non-flag argument
+        // that resolves outside the workdir, the same containment check the file tools use.
+        if let Some(root) = &self.cwd {
+            for arg in &parts[1..] {
+                if arg.starts_with('-') {
+                    continue;
+                }
+                if resolve_within_root(root, arg).is_err() {
+                    return Some(format!("argument escapes working directory: {arg:?}"));
+                }
+            }
+        }
         None
+    }
+
+    /// GNU sed's `e`/`w`/`r` commands (e.g. `1e some-command`, `s/x/y/e`) run arbitrary
+    /// shell commands even inside a script with none of the blocked shell metacharacters.
+    /// Rather than pattern-match every way the `e` flag can be spelled inside a sed
+    /// script, force `--sandbox` (which GNU sed uses to disable e/w/r unconditionally)
+    /// onto every bounded `sed` invocation that doesn't already request it.
+    fn harden_command(command: &str) -> String {
+        let Ok(mut parts) = shell_words::split(command) else { return command.to_string() };
+        if parts.first().map(String::as_str) != Some("sed") {
+            return command.to_string();
+        }
+        if parts.iter().any(|p| p == "--sandbox") {
+            return command.to_string();
+        }
+        parts.insert(1, "--sandbox".to_string());
+        shell_words::join(parts)
     }
 }
 
@@ -481,8 +557,10 @@ impl AgentTool for BashTool {
             .and_then(|v| v.as_i64())
             .map(|t| Duration::from_secs(t.max(0) as u64));
 
+        let command = if self.bounded { Self::harden_command(command) } else { command.to_string() };
+
         let mut cmd = std::process::Command::new("bash");
-        cmd.arg("-c").arg(command);
+        cmd.arg("-c").arg(&command);
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
@@ -832,6 +910,21 @@ mod tests {
     }
 
     #[test]
+    fn bash_description_surfaces_caveats_only_for_allowed_commands() {
+        let with_all: HashSet<String> = ["find", "rg", "sed"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(with_all));
+        assert!(tool.description().contains("-exec/-execdir/-ok/-okdir"));
+        assert!(tool.description().contains("--pre/--pre-glob"));
+        assert!(tool.description().contains("--sandbox"));
+
+        let echo_only: HashSet<String> = ["echo"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(echo_only));
+        assert!(!tool.description().contains("-exec"));
+        assert!(!tool.description().contains("--pre"));
+        assert!(!tool.description().contains("--sandbox"));
+    }
+
+    #[test]
     fn bash_rejects_disallowed_command() {
         let allow: HashSet<String> = ["ls"].iter().map(|s| s.to_string()).collect();
         let tool = BashTool::new(None, true, Some(allow));
@@ -847,6 +940,49 @@ mod tests {
             let out = tool.run(&serde_json::json!({"command": cmd}));
             assert!(out.starts_with("Error:"), "expected {cmd:?} to be rejected, got: {out}");
         }
+    }
+
+    #[test]
+    fn bash_blocks_argument_path_escape() {
+        // Regression test: `current_dir` alone doesn't stop an allowed command's
+        // *arguments* from pointing outside the workdir (e.g. `grep secret /etc/passwd`).
+        let dir = unique_test_dir("bash_arg_escape");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = unique_test_dir("bash_arg_escape_outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, "TOP-SECRET").unwrap();
+
+        let allow: HashSet<String> = ["grep", "find"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+
+        let abs_out = tool.run(&serde_json::json!({"command": format!("grep TOP-SECRET {}", outside_file.display())}));
+        assert!(abs_out.starts_with("Error:"), "expected absolute-path escape to be rejected, got: {abs_out}");
+        assert!(!abs_out.contains("TOP-SECRET"));
+
+        let traversal_out = tool.run(&serde_json::json!({"command": "grep TOP-SECRET ../bash_arg_escape_outside_nonexistent"}));
+        assert!(traversal_out.starts_with("Error:"), "expected relative traversal to be rejected, got: {traversal_out}");
+
+        let find_out = tool.run(&serde_json::json!({"command": "find / -name secret.txt"}));
+        assert!(find_out.starts_with("Error:"), "expected absolute find root to be rejected, got: {find_out}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn bash_allows_argument_within_workdir() {
+        let dir = unique_test_dir("bash_arg_ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), "hello world").unwrap();
+
+        let allow: HashSet<String> = ["grep"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "grep hello file.txt"}));
+        assert!(!out.starts_with("Error:"), "unexpected error for in-workdir argument: {out}");
+        assert!(out.contains("hello world"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -895,6 +1031,82 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let result = resolve_within_root(&dir, "brand_new_file.txt");
         assert!(result.is_ok(), "should allow resolving a path to a not-yet-existing file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_blocks_find_exec() {
+        // Regression test: `find`'s -exec/-execdir/-ok/-okdir spawn an arbitrary
+        // program per matched file, fully bypassing the command allowlist without
+        // needing any of the blocked shell metacharacters.
+        let dir = unique_test_dir("find_exec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let allow: HashSet<String> = ["find"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+        for cmd in ["find . -exec touch pwned {} +", "find . -execdir id {} ;", "find . -ok id {} +", "find . -okdir id {} +"] {
+            let out = tool.run(&serde_json::json!({"command": cmd}));
+            assert!(out.starts_with("Error:"), "expected {cmd:?} to be rejected, got: {out}");
+        }
+        assert!(!dir.join("pwned").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_find_without_exec_still_works() {
+        let dir = unique_test_dir("find_ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let allow: HashSet<String> = ["find"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "find . -name a.txt"}));
+        assert!(!out.starts_with("Error:"), "unexpected error: {out}");
+        assert!(out.contains("a.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_blocks_rg_pre() {
+        // Regression test: ripgrep's --pre/--pre-glob run an arbitrary preprocessor
+        // program per file, e.g. `rg --pre sh ...` executes the searched file's
+        // contents as a shell script.
+        let dir = unique_test_dir("rg_pre");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "echo INJECTED\ntouch RG_MARKER\n").unwrap();
+        let allow: HashSet<String> = ["rg"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+        for cmd in ["rg --pre sh -e INJECTED .", "rg --pre=sh -e INJECTED .", "rg --pre-glob '*.txt' --pre sh -e INJECTED ."] {
+            let out = tool.run(&serde_json::json!({"command": cmd}));
+            assert!(out.starts_with("Error:"), "expected {cmd:?} to be rejected, got: {out}");
+        }
+        assert!(!dir.join("RG_MARKER").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_sandboxes_sed_e_command() {
+        // Regression test: GNU sed's `e` command (e.g. `1e some-command`, `s/x/y/e`)
+        // executes arbitrary shell commands; `--sandbox` is force-injected to disable it.
+        let dir = unique_test_dir("sed_e");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "line1\n").unwrap();
+        let allow: HashSet<String> = ["sed"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "sed -n '1e echo INJECTED_BY_SED' f.txt"}));
+        assert!(!out.contains("INJECTED_BY_SED"), "sed e-command should be sandboxed, got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_sed_normal_substitution_still_works() {
+        let dir = unique_test_dir("sed_ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "hello world\n").unwrap();
+        let allow: HashSet<String> = ["sed"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "sed -i 's/world/there/' f.txt"}));
+        assert!(!out.starts_with("Error:"), "unexpected error: {out}");
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "hello there\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

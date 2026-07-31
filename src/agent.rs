@@ -1,4 +1,4 @@
-//! Standalone coding agent (native tool-calling ReAct loop).
+//! Standalone coding agent with a native tool-calling loop.
 //!
 //! Ports `codescribe/lib/_agent.py` (minus the `RunObserver`/`ConsoleObserver`
 //! presentation types, which live in `observer.rs`).
@@ -43,7 +43,7 @@ pub struct AgentPolicy {
     pub max_tool_calls_total: u32,
     pub max_calls_per_iteration: u32,
     pub max_repeated_calls: u32,
-    /// Reads get more repeats (paging / post-edit verify).
+    /// Reads get more repeats for paging and post-edit verification.
     pub read_repeat_multiplier: u32,
     pub max_consecutive_error_iters: u32,
     pub max_history_chars: usize,
@@ -76,9 +76,10 @@ impl TokenUsage {
         self.input + self.output + self.cache_write + self.cache_read
     }
 
-    /// Build from a provider usage JSON payload (Anthropic-shaped; OpenAI-shaped keys
-    /// are also recognized for parity with the Python source, even though csloop only
-    /// ever talks to Anthropic).
+    /// Build from a provider usage JSON payload. Both Anthropic-shaped (`input_tokens`/
+    /// `output_tokens`) and OpenAI-shaped (`prompt_tokens`/`completion_tokens`) keys are
+    /// recognized, even though csloop only ever talks to Anthropic — kept for parity
+    /// with the Python source and in case another provider is wired in later.
     pub fn from_raw(usage: Option<&serde_json::Value>) -> Self {
         let Some(u) = usage else { return Self::default() };
         let get = |key: &str| u.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -121,9 +122,9 @@ impl std::ops::AddAssign for TokenUsage {
     }
 }
 
-/// One executed tool call, surfaced via `RunResult`. Only real executions are recorded
-/// here (blocked-repeat and unparseable-args calls are not) so downstream summaries
-/// reflect actual workspace actions.
+/// One executed tool call surfaced through `RunResult`. Only real executions are
+/// recorded here — blocked-repeat and unparseable-args calls are not — so downstream
+/// summaries reflect actual workspace actions.
 pub struct ToolResult {
     pub name: String,
     pub args: serde_json::Value,
@@ -148,17 +149,17 @@ impl RejectReason {
     }
 }
 
-/// A tool call the agent attempted but the harness refused to execute — never touched
-/// the workspace, so it's kept out of `tool_results`.
+/// A tool call the harness refused to execute — never touched the workspace, so it's
+/// kept out of `tool_results`.
 pub struct RejectedCall {
     pub name: String,
     pub args: serde_json::Value,
     pub reason: RejectReason,
 }
 
-/// Normalized per-iteration telemetry, collected for downstream loop analysis. Ported
-/// for parity with `_agent.py`'s `IterationTelemetry` — not currently persisted
-/// anywhere (Python doesn't write it to phase metadata either; it's forward-compat data).
+/// Normalized per-iteration telemetry, collected for downstream loop analysis. Not
+/// currently persisted anywhere (forward-compat data, kept for parity with the
+/// Python source's `IterationTelemetry`).
 #[allow(dead_code)]
 pub struct IterationTelemetry {
     pub iteration: u32,
@@ -216,8 +217,8 @@ struct RecentEntry {
     tool: String,
     args_preview: String,
     summary: String,
-    // Set (matching Python's `rec["ok"]`) but not read by `workspace_context_block`
-    // in either implementation — kept for structural parity.
+    // Set (matching Python's `rec["ok"]`) but not read by `workspace_context_block` in
+    // either implementation — kept for structural parity.
     #[allow(dead_code)]
     ok: bool,
 }
@@ -236,8 +237,7 @@ struct RunState {
 }
 
 // ---------------------------------------------------------------------------
-// Free-function helpers (module-level in Python; kept free here too since they
-// don't need `self`)
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn round3(x: f64) -> f64 {
@@ -402,7 +402,9 @@ fn validate_schema_value(schema: &serde_json::Value, value: &serde_json::Value, 
 
 fn tool_call_key(name: &str, args: &serde_json::Value) -> String {
     // Relies on serde_json's default (non-`preserve_order`) sorted-key object
-    // serialization to match Python's `json.dumps(args, sort_keys=True)`.
+    // serialization to match Python's `json.dumps(args, sort_keys=True)`. If the
+    // `preserve_order` feature is ever enabled, this key stops being stable and the
+    // repeat-call detection above silently breaks.
     let json = serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
     format!("{name}:{json}")
 }
@@ -435,8 +437,7 @@ fn workspace_context_block(state: &RunStateView, iteration: u32, max_iterations:
 }
 
 /// Borrowed view of the fields `workspace_context_block` needs, so it doesn't need a
-/// full `&RunState` (kept private to this module either way, but avoids re-deriving a
-/// second struct).
+/// full `&RunState`.
 struct RunStateView<'a> {
     tool_calls_total: u32,
     recent_errors: &'a [String],
@@ -679,6 +680,170 @@ impl Agent {
         }
     }
 
+    fn max_repeats_for_tool(&self, tool_name: &str) -> u32 {
+        if tool_name == "read" {
+            self.policy.max_repeated_calls * self.policy.read_repeat_multiplier
+        } else {
+            self.policy.max_repeated_calls
+        }
+    }
+
+    fn repeated_call_hint(max_repeats: u32) -> String {
+        format!(
+            "Error: repeated tool call blocked after {max_repeats} tries. \
+             Change arguments (e.g., different offset/limit/path) or change approach."
+        )
+    }
+
+    fn execute_one_tool_call(
+        &self,
+        state: &mut RunState,
+        call: &ToolCall,
+        model_text: &str,
+        run_id: &str,
+        iteration: u32,
+    ) -> (ToolCall, String) {
+        let call_name = call.name.clone();
+        let call_args = call.arguments.clone();
+        let max_repeats = self.max_repeats_for_tool(&call_name);
+
+        let key = tool_call_key(&call_name, &call_args);
+        let count = state.call_counts.entry(key).or_insert(0);
+        *count += 1;
+
+        if *count > max_repeats {
+            let hint = Self::repeated_call_hint(max_repeats);
+            self.record_tool_result(state, &call_name, &call_args, &hint);
+            self.record_rejected_call(state, &call_name, &call_args, RejectReason::RepeatBlocked, run_id, iteration);
+            return (
+                ToolCall {
+                    id: call.id.clone(),
+                    name: call_name,
+                    arguments: call_args,
+                    raw_arguments: None,
+                    raw_arguments_error: None,
+                },
+                hint,
+            );
+        }
+
+        self.observer.on_tool_start(&call_name, &Self::format_args(&call_name, &call_args));
+
+        let output = if let Some(err) = &call.raw_arguments_error {
+            let raw = call.raw_arguments.clone().unwrap_or_default();
+            let out = format!(
+                "Error: tool call arguments were not valid JSON and could not be parsed.\n\
+                 tool={call_name:?}\nparse_error={err}\nraw_arguments={raw:?}\n\
+                 Fix: emit a tool call with a JSON object matching the tool schema."
+            );
+            self.record_rejected_call(state, &call_name, &call_args, RejectReason::BadJson, run_id, iteration);
+            out
+        } else {
+            let out = self.execute_tool(&call_name, &call_args, run_id, iteration, Some(model_text));
+            state.tool_calls_total += 1;
+            state.tool_results.push(ToolResult {
+                name: call_name.clone(),
+                args: call_args.clone(),
+                ok: !is_error_output(&out),
+                output_preview: out.chars().take(500).collect(),
+            });
+            out
+        };
+
+        self.record_tool_result(state, &call_name, &call_args, &output);
+
+        if !is_error_output(&output) && (call_name == "edit" || call_name == "write") {
+            state.call_counts.clear();
+        }
+
+        self.observer.on_tool_end(&call_name, &output);
+
+        (
+            ToolCall {
+                id: call.id.clone(),
+                name: call_name,
+                arguments: call_args,
+                raw_arguments: None,
+                raw_arguments_error: None,
+            },
+            output,
+        )
+    }
+
+    fn history_output(&self, output: &str) -> String {
+        if is_error_output(output) || output.chars().count() <= self.policy.max_history_chars {
+            return output.to_string();
+        }
+
+        let omitted = output.chars().count() - self.policy.max_history_chars;
+        let truncated: String = output.chars().take(self.policy.max_history_chars).collect();
+        format!(
+            "{truncated}\n…[output truncated: {omitted} chars omitted. \
+             Use read(path, offset=N) to page through the rest.]"
+        )
+    }
+
+    fn append_skipped_tool_calls(
+        &self,
+        state: &mut RunState,
+        tool_calls: &[ToolCall],
+        start_idx: usize,
+        outputs: &mut Vec<String>,
+        executed_calls: &mut Vec<ToolCall>,
+        run_id: &str,
+        iteration: u32,
+    ) {
+        let skipped = tool_calls.len().saturating_sub(start_idx);
+        if skipped == 0 {
+            return;
+        }
+
+        for call in &tool_calls[start_idx..] {
+            self.record_rejected_call(state, &call.name, &call.arguments, RejectReason::IterationSkip, run_id, iteration);
+        }
+
+        outputs.push(format!(
+            "Note: {skipped} tool call(s) were skipped this iteration due to \
+             max_tool_calls_per_iteration={}.",
+            self.policy.max_calls_per_iteration
+        ));
+        executed_calls.push(ToolCall {
+            id: "skipped_tool_calls_note".to_string(),
+            name: "note".to_string(),
+            arguments: serde_json::json!({}),
+            raw_arguments: None,
+            raw_arguments_error: None,
+        });
+    }
+
+    fn update_consecutive_error_state(&self, state: &mut RunState, outputs: &[String]) {
+        let real_outputs: Vec<&String> = outputs.iter().filter(|output| !output.starts_with("Note:")).collect();
+        if !real_outputs.is_empty() && real_outputs.iter().all(|output| is_error_output(output)) {
+            state.consecutive_error_iters += 1;
+        } else {
+            state.consecutive_error_iters = 0;
+        }
+    }
+
+    fn append_stuck_nudge_if_needed(&self, state: &mut RunState, messages: &mut Vec<serde_json::Value>) {
+        if state.consecutive_error_iters < self.policy.max_consecutive_error_iters {
+            return;
+        }
+
+        state.consecutive_error_iters = 0;
+        let stuck = "Every tool call for several consecutive iterations has failed. \
+                     Stop attempting tool calls and output a BLOCKED: section \
+                     listing exactly what is preventing progress and what the user must resolve.";
+        let last_is_str = messages.last().and_then(|m| m.get("content")).and_then(|c| c.as_str()).is_some();
+        if last_is_str {
+            let last = messages.last_mut().unwrap();
+            let content = last["content"].as_str().unwrap().to_string();
+            last["content"] = serde_json::Value::String(format!("{content}\n\n{stuck}"));
+        } else {
+            messages.push(serde_json::json!({"role": "user", "content": stuck}));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_tool_calls(
         &self,
@@ -695,137 +860,34 @@ impl Agent {
         }
 
         let limit = self.policy.max_calls_per_iteration as usize;
-        let limited_calls: &[ToolCall] = if tool_calls.len() > limit { &tool_calls[..limit] } else { tool_calls };
-        let skipped = tool_calls.len().saturating_sub(limited_calls.len());
+        let limited_call_count = tool_calls.len().min(limit);
 
         let mut outputs: Vec<String> = Vec::new();
         let mut executed_calls: Vec<ToolCall> = Vec::new();
 
-        for call in limited_calls {
-            let call_name = call.name.clone();
-            let call_args = call.arguments.clone();
+        for call in &tool_calls[..limited_call_count] {
+            let (executed_call, output) =
+                self.execute_one_tool_call(state, call, model_text, run_id, iteration);
 
-            let max_repeats = if call_name == "read" {
-                self.policy.max_repeated_calls * self.policy.read_repeat_multiplier
-            } else {
-                self.policy.max_repeated_calls
-            };
-
-            let key = tool_call_key(&call_name, &call_args);
-            let count = state.call_counts.entry(key).or_insert(0);
-            *count += 1;
-            let current_count = *count;
-
-            if current_count > max_repeats {
-                let hint = format!(
-                    "Error: repeated tool call blocked after {max_repeats} tries. \
-                     Change arguments (e.g., different offset/limit/path) or change approach."
-                );
-                self.record_tool_result(state, &call_name, &call_args, &hint);
-                self.record_rejected_call(state, &call_name, &call_args, RejectReason::RepeatBlocked, run_id, iteration);
-                outputs.push(hint);
-                executed_calls.push(ToolCall {
-                    id: call.id.clone(),
-                    name: call_name,
-                    arguments: call_args,
-                    raw_arguments: None,
-                    raw_arguments_error: None,
-                });
-                continue;
-            }
-
-            self.observer.on_tool_start(&call_name, &Self::format_args(&call_name, &call_args));
-
-            let output = if let Some(err) = &call.raw_arguments_error {
-                let raw = call.raw_arguments.clone().unwrap_or_default();
-                let out = format!(
-                    "Error: tool call arguments were not valid JSON and could not be parsed.\n\
-                     tool={call_name:?}\nparse_error={err}\nraw_arguments={raw:?}\n\
-                     Fix: emit a tool call with a JSON object matching the tool schema."
-                );
-                self.record_rejected_call(state, &call_name, &call_args, RejectReason::BadJson, run_id, iteration);
-                out
-            } else {
-                let out = self.execute_tool(&call_name, &call_args, run_id, iteration, Some(model_text));
-                state.tool_calls_total += 1;
-                state.tool_results.push(ToolResult {
-                    name: call_name.clone(),
-                    args: call_args.clone(),
-                    ok: !is_error_output(&out),
-                    output_preview: out.chars().take(500).collect(),
-                });
-                out
-            };
-
-            self.record_tool_result(state, &call_name, &call_args, &output);
-
-            if !is_error_output(&output) && (call_name == "edit" || call_name == "write") {
-                state.call_counts.clear();
-            }
-
-            let msg_output = if !is_error_output(&output) && output.chars().count() > self.policy.max_history_chars {
-                let omitted = output.chars().count() - self.policy.max_history_chars;
-                let truncated: String = output.chars().take(self.policy.max_history_chars).collect();
-                format!(
-                    "{truncated}\n…[output truncated: {omitted} chars omitted. \
-                     Use read(path, offset=N) to page through the rest.]"
-                )
-            } else {
-                output.clone()
-            };
-            outputs.push(msg_output);
-            self.observer.on_tool_end(&call_name, &output);
-            executed_calls.push(ToolCall {
-                id: call.id.clone(),
-                name: call_name,
-                arguments: call_args,
-                raw_arguments: None,
-                raw_arguments_error: None,
-            });
+            outputs.push(self.history_output(&output));
+            executed_calls.push(executed_call);
         }
 
-        if skipped > 0 {
-            for call in &tool_calls[limited_calls.len()..] {
-                self.record_rejected_call(state, &call.name, &call.arguments, RejectReason::IterationSkip, run_id, iteration);
-            }
-            outputs.push(format!(
-                "Note: {skipped} tool call(s) were skipped this iteration due to \
-                 max_tool_calls_per_iteration={}.",
-                self.policy.max_calls_per_iteration
-            ));
-            executed_calls.push(ToolCall {
-                id: "skipped_tool_calls_note".to_string(),
-                name: "note".to_string(),
-                arguments: serde_json::json!({}),
-                raw_arguments: None,
-                raw_arguments_error: None,
-            });
-        }
+        self.append_skipped_tool_calls(
+            state,
+            tool_calls,
+            limited_call_count,
+            &mut outputs,
+            &mut executed_calls,
+            run_id,
+            iteration,
+        );
 
         let tool_result_messages = self.model.format_tool_result_messages(&executed_calls, &outputs, reasoning_blocks);
         messages.extend(tool_result_messages);
 
-        let real_outputs: Vec<&String> = outputs.iter().filter(|o| !o.starts_with("Note:")).collect();
-        if !real_outputs.is_empty() && real_outputs.iter().all(|o| is_error_output(o)) {
-            state.consecutive_error_iters += 1;
-        } else {
-            state.consecutive_error_iters = 0;
-        }
-
-        if state.consecutive_error_iters >= self.policy.max_consecutive_error_iters {
-            state.consecutive_error_iters = 0;
-            let stuck = "Every tool call for several consecutive iterations has failed. \
-                         Stop attempting tool calls and output a BLOCKED: section \
-                         listing exactly what is preventing progress and what the user must resolve.";
-            let last_is_str = messages.last().and_then(|m| m.get("content")).and_then(|c| c.as_str()).is_some();
-            if last_is_str {
-                let last = messages.last_mut().unwrap();
-                let content = last["content"].as_str().unwrap().to_string();
-                last["content"] = serde_json::Value::String(format!("{content}\n\n{stuck}"));
-            } else {
-                messages.push(serde_json::json!({"role": "user", "content": stuck}));
-            }
-        }
+        self.update_consecutive_error_state(state, &outputs);
+        self.append_stuck_nudge_if_needed(state, messages);
 
         None
     }

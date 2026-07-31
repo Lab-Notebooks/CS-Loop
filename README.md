@@ -7,11 +7,14 @@ with CodeScribe (https://github.com/Lab-Notebooks/CodeScribe)
 ## Install
 
 ```sh
-cargo install --git https://github.com/Lab-Notebooks/CS-Loop
+cargo install --git https://github.com/Lab-Notebooks/CS-Loop --tag v2026.7.0 --locked
 ```
 
 This builds and installs the `csloop` binary to `~/.cargo/bin` — no source checkout is
-left behind.
+left behind. Pinning `--tag` installs a specific, reviewable release instead of whatever
+happens to be on the default branch at install time; `--locked` makes the build use the
+exact dependency versions recorded in `Cargo.lock` instead of re-resolving to whatever's
+newest on crates.io at install time.
 
 ### Install over SSH
 
@@ -19,7 +22,7 @@ Useful if the repository is private or you'd rather authenticate with your SSH k
 an HTTPS credential helper:
 
 ```sh
-cargo install --git ssh://git@github.com/Lab-Notebooks/CS-Loop.git
+cargo install --git ssh://git@github.com/Lab-Notebooks/CS-Loop.git --tag v2026.7.0 --locked
 ```
 
 Cargo's built-in git support requires the full `ssh://` form — the scp-like shorthand
@@ -43,13 +46,13 @@ export CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 ## Update
 
-`cargo install --git` won't overwrite an existing install by default. Reinstall from the
-latest commit on the default branch with `--force`:
+`cargo install --git` won't overwrite an existing install by default. Reinstall a given
+release with `--force`, updating `--tag` to the version you want:
 
 ```sh
-cargo install --force --git https://github.com/Lab-Notebooks/CS-Loop
+cargo install --force --git https://github.com/Lab-Notebooks/CS-Loop --tag v2026.7.0 --locked
 # or, over SSH:
-cargo install --force --git ssh://git@github.com/Lab-Notebooks/CS-Loop.git
+cargo install --force --git ssh://git@github.com/Lab-Notebooks/CS-Loop.git --tag v2026.7.0 --locked
 ```
 
 Check what's currently installed with:

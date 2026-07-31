@@ -55,27 +55,51 @@ fn action_preview(tool: &str, args: &serde_json::Value) -> String {
     }
 }
 
+fn record_tool_error(summary: &mut LoopSummary, tool_name: &str, action: &str, preview: &str) {
+    let err_msg = if preview.is_empty() {
+        "unknown error".to_string()
+    } else {
+        truncate_ap(preview, 80)
+    };
+    summary.errors.push(format!("{tool_name}({action}): {err_msg}"));
+}
+
+fn record_bash_command(summary: &mut LoopSummary, action: &str, preview: &str) {
+    let first_line = truncate_ap(preview.lines().next().unwrap_or(""), 60);
+    summary.commands_run.push(format!("{action}  →  {first_line}"));
+}
+
 /// Build a harness-computed `LoopSummary` directly from an `Agent::run()` result,
 /// rather than re-parsing an event log.
 pub fn loop_summary_from_result(loop_index: u32, result: &RunResult) -> LoopSummary {
     let mut summary = LoopSummary { loop_index, ..Default::default() };
 
     for tr in &result.tool_results {
-        let ap = action_preview(&tr.name, &tr.args);
+        let action = action_preview(&tr.name, &tr.args);
         let preview = tr.output_preview.trim();
 
         if !tr.ok {
-            let err_msg = if !preview.is_empty() { truncate_ap(preview, 80) } else { "unknown error".to_string() };
-            summary.errors.push(format!("{}({ap}): {err_msg}", tr.name));
-        } else if tr.name == "write" {
-            summary.files_written.push(ap);
-        } else if tr.name == "edit" {
-            summary.files_edited.push(ap);
-        } else if tr.name == "read" {
-            summary.files_read.push(ap);
-        } else if tr.name == "bash" {
-            let first = truncate_ap(preview.lines().next().unwrap_or(""), 60);
-            summary.commands_run.push(format!("{ap}  →  {first}"));
+            record_tool_error(&mut summary, &tr.name, &action, preview);
+            continue;
+        }
+
+        if tr.name == "write" {
+            summary.files_written.push(action);
+            continue;
+        }
+
+        if tr.name == "edit" {
+            summary.files_edited.push(action);
+            continue;
+        }
+
+        if tr.name == "read" {
+            summary.files_read.push(action);
+            continue;
+        }
+
+        if tr.name == "bash" {
+            record_bash_command(&mut summary, &action, preview);
         }
     }
 
@@ -731,8 +755,11 @@ impl PromptLoopRunner {
     }
 
     fn build_review_tools(&self) -> Vec<Box<dyn AgentTool>> {
+        // Deliberately excludes "env"/"printenv": those dump the process environment
+        // (including ANTHROPIC_API_KEY) into tool output, which gets persisted in
+        // plaintext to review.toml/loop metadata and re-sent to the model as a tool result.
         let review_bash_allow: HashSet<String> =
-            ["ls", "stat", "pwd", "find", "grep", "head", "tail", "which", "env", "rg"]
+            ["ls", "stat", "pwd", "find", "grep", "head", "tail", "which", "rg"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
@@ -754,17 +781,22 @@ impl PromptLoopRunner {
 
     fn apply_review_data(&mut self, review_data: &toml::Table) -> bool {
         if let Some(pending_val) = review_data.get("pending").and_then(|v| v.as_array()) {
-            let items: Vec<String> = pending_val
-                .iter()
-                .filter_map(|p| {
-                    if let Some(t) = p.as_table() {
-                        t.get("item").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    } else {
-                        p.as_str().map(|s| s.to_string())
+            let mut items = Vec::new();
+
+            for pending_entry in pending_val {
+                let item = if let Some(table) = pending_entry.as_table() {
+                    table.get("item").and_then(|value| value.as_str())
+                } else {
+                    pending_entry.as_str()
+                };
+
+                if let Some(item) = item {
+                    if !item.is_empty() {
+                        items.push(item.to_string());
                     }
-                })
-                .filter(|s| !s.is_empty())
-                .collect();
+                }
+            }
+
             self.pending_items = items;
         }
         let blocker = review_data.get("blocker").and_then(|v| v.as_str()).unwrap_or("");
@@ -864,8 +896,6 @@ mod tests {
 
     #[test]
     fn extract_status_requires_leading_word_match() {
-        // A STATUS: line whose value doesn't start with COMPLETE/INCOMPLETE shouldn't
-        // match either variant.
         assert_eq!(extract_status("STATUS: UNKNOWN"), None);
     }
 
@@ -878,8 +908,6 @@ mod tests {
 
     #[test]
     fn extract_pending_items_multi_digit_bullets_fixed() {
-        // The Python reference only recognizes single-digit numbering (a hardcoded
-        // `stripped[1:3]` index check); this port fixes it to handle any digit count.
         let text = "STATUS: INCOMPLETE\nNEXT STEPS:\n9. ninth item\n10. tenth item\n11) eleventh item\n";
         let items = extract_pending_items(text);
         assert_eq!(
