@@ -79,6 +79,23 @@ pub fn resolve_within_root(root: &Path, target: &str) -> anyhow::Result<PathBuf>
     Ok(resolved)
 }
 
+/// True if any path component is `.git` (repo metadata/hooks/config) — used to keep the
+/// agent's own write/edit tools from hand-writing git plumbing (e.g. `.git/config`,
+/// `.git/hooks/*`) which could otherwise turn a later plain `git` invocation (via the
+/// bounded bash tool) into arbitrary command execution.
+pub fn is_git_internal<P: AsRef<Path>>(path: P) -> bool {
+    path.as_ref().components().any(|c| c.as_os_str() == ".git")
+}
+
+/// True if an already-resolved path (as returned by `resolve_within_root`/`lexical_resolve`)
+/// is one of `protected_paths` (e.g. the task file, which grants tool policy at construction
+/// and must never be readable/writable through the agent's own sandboxed tools). Takes a
+/// pre-resolved path rather than resolving internally, since `canonicalize()` requires the
+/// target to exist and callers like `WriteTool` must also protect not-yet-existing paths.
+pub fn is_protected_path(resolved_path: &Path, protected_paths: &HashSet<PathBuf>) -> bool {
+    !protected_paths.is_empty() && protected_paths.contains(resolved_path)
+}
+
 // ---------------------------------------------------------------------------
 // ReadTool
 // ---------------------------------------------------------------------------
@@ -350,6 +367,7 @@ pub struct BashTool {
     cwd: Option<PathBuf>,
     bounded: bool,
     allowed_commands: HashSet<String>,
+    protected_paths: HashSet<PathBuf>,
     enabled: bool,
     description: String,
     parameters: serde_json::Value,
@@ -437,6 +455,13 @@ impl BashTool {
                      (e.g. '1e cmd', 's/x/y/e') are disabled; use sed only for text substitution.",
                 );
             }
+            if allowed_commands.contains("git") {
+                caveats.push(
+                    "git: the config subcommand and -c/-p/--paginate/--exec-path/--git-dir/\
+                     --work-tree/--namespace/--upload-pack/--receive-pack/--upload-archive flags \
+                     are rejected, as are ext:: and fd:: transport URLs.",
+                );
+            }
             if !caveats.is_empty() {
                 desc.push(' ');
                 desc.push_str(&caveats.join(" "));
@@ -451,7 +476,22 @@ impl BashTool {
             "required": ["command"],
             "additionalProperties": false
         });
-        Self { cwd, bounded, allowed_commands, enabled: true, description: desc, parameters }
+        Self {
+            cwd,
+            bounded,
+            allowed_commands,
+            protected_paths: HashSet::new(),
+            enabled: true,
+            description: desc,
+            parameters,
+        }
+    }
+
+    /// Marks resolved paths (e.g. the task file) that no bash command may target, even to
+    /// read — see `tools::is_protected_path`.
+    pub fn with_protected_paths(mut self, protected_paths: HashSet<PathBuf>) -> Self {
+        self.protected_paths = protected_paths;
+        self
     }
 
     fn validate_command(&self, command: &str) -> Option<String> {
@@ -479,10 +519,13 @@ impl BashTool {
         // metacharacters above. Reject those flags outright — there's no legitimate
         // use of them for a read-only search/inspection tool.
         if (exe == "find" || exe == "bfs" || exe == "gfind")
-            && let Some(bad) =
-                parts[1..].iter().find(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+            && let Some(bad) = parts[1..]
+                .iter()
+                .find(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete"))
         {
-            return Some(format!("disallowed {exe} flag {bad:?}: spawns an arbitrary program per match"));
+            return Some(format!(
+                "disallowed {exe} flag {bad:?}: spawns an arbitrary program per match or deletes files"
+            ));
         }
         if exe == "rg"
             && parts[1..]
@@ -492,17 +535,60 @@ impl BashTool {
             return Some("disallowed rg flag --pre/--pre-glob: spawns an arbitrary preprocessor program".to_string());
         }
 
+        // git's own config surface is a full command-execution vector on its own, with no
+        // blocked shell metacharacters needed: `config`/`-c` can set core.pager,
+        // core.fsmonitor, alias.*, diff.external, etc, any of which turns a later plain
+        // `git status`/`git log`/`git <alias>` into arbitrary command execution. The
+        // remaining flags below extend the same escape (forcing pager execution, pointing
+        // git at a different repo/exec path, or driving a remote-command flag), and
+        // ext::/fd:: are transport-helper URL schemes that spawn an arbitrary program.
+        if exe == "git" {
+            if parts[1..].iter().any(|a| a == "config") {
+                return Some(
+                    "disallowed git subcommand 'config': can set core.pager/core.fsmonitor/alias.*/etc, \
+                     turning a later plain git invocation into arbitrary command execution"
+                        .to_string(),
+                );
+            }
+            const GIT_FLAG_PREFIXES: &[&str] = &[
+                "--exec-path",
+                "--git-dir",
+                "--work-tree",
+                "--namespace",
+                "--upload-pack",
+                "--receive-pack",
+                "--upload-archive",
+            ];
+            if let Some(bad) = parts[1..].iter().find(|a| {
+                matches!(a.as_str(), "-c" | "-p" | "--paginate")
+                    || GIT_FLAG_PREFIXES.iter().any(|p| a.starts_with(p))
+            }) {
+                return Some(format!("disallowed git flag {bad:?}: can override config/paths or force hook execution"));
+            }
+            if let Some(bad) = parts[1..].iter().find(|a| a.contains("ext::") || a.contains("fd::")) {
+                return Some(format!(
+                    "disallowed git argument {bad:?}: ext:: and fd:: transports spawn an arbitrary helper program"
+                ));
+            }
+        }
+
         // `current_dir` alone only bounds where the process starts, not what its
         // arguments point at (e.g. `grep secret /etc/passwd`, `find / -name id_rsa`
         // would otherwise read anywhere the OS user can). Reject any non-flag argument
         // that resolves outside the workdir, the same containment check the file tools use.
+        // Also reject any argument that resolves to a protected path (e.g. the task
+        // file) — read or write — since tool-mediated access to it is never legitimate.
         if let Some(root) = &self.cwd {
             for arg in &parts[1..] {
                 if arg.starts_with('-') {
                     continue;
                 }
-                if resolve_within_root(root, arg).is_err() {
-                    return Some(format!("argument escapes working directory: {arg:?}"));
+                let resolved = match resolve_within_root(root, arg) {
+                    Ok(p) => p,
+                    Err(_) => return Some(format!("argument escapes working directory: {arg:?}")),
+                };
+                if is_protected_path(&resolved, &self.protected_paths) {
+                    return Some(format!("argument targets a protected path: {arg:?}"));
                 }
             }
         }
@@ -595,6 +681,7 @@ impl AgentTool for BashTool {
 
 pub struct EditTool {
     root: Option<PathBuf>,
+    protected_paths: HashSet<PathBuf>,
     enabled: bool,
     description: String,
     parameters: serde_json::Value,
@@ -628,7 +715,14 @@ impl EditTool {
             "required": ["path", "edits"],
             "additionalProperties": false
         });
-        Self { root, enabled: true, description: desc, parameters }
+        Self { root, protected_paths: HashSet::new(), enabled: true, description: desc, parameters }
+    }
+
+    /// Marks resolved paths (e.g. the task file) that may never be edited — see
+    /// `tools::is_protected_path`.
+    pub fn with_protected_paths(mut self, protected_paths: HashSet<PathBuf>) -> Self {
+        self.protected_paths = protected_paths;
+        self
     }
 
     /// Compact snippet around a [start:end] char range, matching `EditTool.snippet`.
@@ -688,6 +782,13 @@ impl AgentTool for EditTool {
         } else {
             PathBuf::from(path)
         };
+
+        if is_git_internal(&resolved) {
+            return "Error: editing files under .git/ is not allowed".to_string();
+        }
+        if is_protected_path(&resolved, &self.protected_paths) {
+            return "Error: editing this file is not allowed".to_string();
+        }
 
         if !resolved.exists() {
             return format!("Error: file not found: {}", resolved.display());
@@ -774,6 +875,7 @@ impl AgentTool for EditTool {
 
 pub struct WriteTool {
     root: Option<PathBuf>,
+    protected_paths: HashSet<PathBuf>,
     enabled: bool,
     description: String,
     parameters: serde_json::Value,
@@ -794,7 +896,14 @@ impl WriteTool {
             "required": ["path", "content"],
             "additionalProperties": false
         });
-        Self { root, enabled: true, description: desc, parameters }
+        Self { root, protected_paths: HashSet::new(), enabled: true, description: desc, parameters }
+    }
+
+    /// Marks resolved paths (e.g. the task file) that may never be written — see
+    /// `tools::is_protected_path`.
+    pub fn with_protected_paths(mut self, protected_paths: HashSet<PathBuf>) -> Self {
+        self.protected_paths = protected_paths;
+        self
     }
 }
 
@@ -834,6 +943,13 @@ impl AgentTool for WriteTool {
             PathBuf::from(path)
         };
 
+        if is_git_internal(&resolved) {
+            return "Error: writing files under .git/ is not allowed".to_string();
+        }
+        if is_protected_path(&resolved, &self.protected_paths) {
+            return "Error: writing this file is not allowed".to_string();
+        }
+
         if let Some(parent) = resolved.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return format!("Error: {e}");
@@ -850,15 +966,24 @@ impl AgentTool for WriteTool {
 // Factories
 // ---------------------------------------------------------------------------
 
-pub fn make_tools(root: &Path, bash_allow: &HashSet<String>) -> Vec<Box<dyn AgentTool>> {
+/// `protected_paths` are resolved paths (e.g. the task file) that write/edit/bash may
+/// never target, even though they live inside `root`.
+pub fn make_tools(
+    root: &Path,
+    bash_allow: &HashSet<String>,
+    protected_paths: &HashSet<PathBuf>,
+) -> Vec<Box<dyn AgentTool>> {
     let mut allowed = default_allowed_commands();
     allowed.extend(bash_allow.iter().cloned());
     vec![
         Box::new(ReadTool::new(Some(root.to_path_buf()))),
         Box::new(GlobTool::new(Some(root.to_path_buf()))),
-        Box::new(BashTool::new(Some(root.to_path_buf()), true, Some(allowed))),
-        Box::new(EditTool::new(Some(root.to_path_buf()))),
-        Box::new(WriteTool::new(Some(root.to_path_buf()))),
+        Box::new(
+            BashTool::new(Some(root.to_path_buf()), true, Some(allowed))
+                .with_protected_paths(protected_paths.clone()),
+        ),
+        Box::new(EditTool::new(Some(root.to_path_buf())).with_protected_paths(protected_paths.clone())),
+        Box::new(WriteTool::new(Some(root.to_path_buf())).with_protected_paths(protected_paths.clone())),
     ]
 }
 
@@ -1107,6 +1232,170 @@ mod tests {
         let out = tool.run(&serde_json::json!({"command": "sed -i 's/world/there/' f.txt"}));
         assert!(!out.starts_with("Error:"), "unexpected error: {out}");
         assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "hello there\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_blocks_git_config_subcommand() {
+        // Regression test: `git config core.pager=...`/`core.fsmonitor=...`/`alias.*`
+        // turn a later plain `git status`/`git log`/`git <alias>` into arbitrary command
+        // execution, with none of the blocked shell metacharacters needed.
+        let allow: HashSet<String> = ["git"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "git config core.pager touch"}));
+        assert!(out.starts_with("Error:"), "expected git config to be rejected, got: {out}");
+    }
+
+    #[test]
+    fn bash_blocks_git_dash_c_flag() {
+        let allow: HashSet<String> = ["git"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "git -c core.fsmonitor=touch status"}));
+        assert!(out.starts_with("Error:"), "expected git -c to be rejected, got: {out}");
+    }
+
+    #[test]
+    fn bash_blocks_git_transport_helper_urls() {
+        // Regression test: git's ext::/fd:: transport helpers spawn an arbitrary program.
+        let allow: HashSet<String> = ["git"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(allow));
+        for cmd in ["git clone ext::sh -c id /tmp/x", "git fetch fd::3"] {
+            let out = tool.run(&serde_json::json!({"command": cmd}));
+            assert!(out.starts_with("Error:"), "expected {cmd:?} to be rejected, got: {out}");
+        }
+    }
+
+    #[test]
+    fn bash_blocks_git_remote_command_flags() {
+        let allow: HashSet<String> = ["git"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(None, true, Some(allow));
+        for cmd in ["git -p log", "git --upload-pack=evil fetch", "git --git-dir=/etc status"] {
+            let out = tool.run(&serde_json::json!({"command": cmd}));
+            assert!(out.starts_with("Error:"), "expected {cmd:?} to be rejected, got: {out}");
+        }
+    }
+
+    #[test]
+    fn bash_plain_git_status_still_allowed() {
+        let dir = unique_test_dir("git_plain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let allow: HashSet<String> = ["git"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+        for cmd in ["git status", "git log", "git diff"] {
+            let out = tool.run(&serde_json::json!({"command": cmd}));
+            assert!(!out.starts_with("Error:"), "expected {cmd:?} to pass validation, got: {out}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_blocks_find_delete() {
+        // Regression test: `find`'s -delete was the one destructive flag left unblocked
+        // alongside -exec/-execdir/-ok/-okdir.
+        let dir = unique_test_dir("find_delete");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let allow: HashSet<String> = ["find"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow));
+        let out = tool.run(&serde_json::json!({"command": "find . -name a.txt -delete"}));
+        assert!(out.starts_with("Error:"), "expected -delete to be rejected, got: {out}");
+        assert!(dir.join("a.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_blocks_git_internal_path() {
+        let dir = unique_test_dir("write_git_internal");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let tool = WriteTool::new(Some(dir.clone()));
+        let out = tool.run(&serde_json::json!({"path": ".git/config", "content": "[core]\n\tpager = touch pwned\n"}));
+        assert!(out.starts_with("Error:"), "expected .git write to be rejected, got: {out}");
+        assert!(!dir.join(".git").join("config").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_blocks_git_internal_path() {
+        let dir = unique_test_dir("edit_git_internal");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git").join("config"), "orig").unwrap();
+        let tool = EditTool::new(Some(dir.clone()));
+        let out = tool.run(&serde_json::json!({
+            "path": ".git/config",
+            "edits": [{"oldText": "orig", "newText": "bad"}]
+        }));
+        assert!(out.starts_with("Error:"), "expected .git edit to be rejected, got: {out}");
+        assert_eq!(std::fs::read_to_string(dir.join(".git").join("config")).unwrap(), "orig");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_blocks_protected_path() {
+        // Regression test: the task file grants tool policy ([tools].bash) at construction
+        // and must not be tool-writable, or an agent could rewrite it to grant itself new
+        // bash commands mid-run.
+        let dir = unique_test_dir("write_protected");
+        std::fs::create_dir_all(&dir).unwrap();
+        let task_file = dir.join("task.toml");
+        std::fs::write(&task_file, "orig").unwrap();
+        let protected = HashSet::from([task_file.canonicalize().unwrap()]);
+        let tool = WriteTool::new(Some(dir.clone())).with_protected_paths(protected);
+        let out = tool.run(&serde_json::json!({"path": "task.toml", "content": "evil"}));
+        assert!(out.starts_with("Error:"), "expected protected-path write to be rejected, got: {out}");
+        assert_eq!(std::fs::read_to_string(&task_file).unwrap(), "orig");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_blocks_protected_path() {
+        let dir = unique_test_dir("edit_protected");
+        std::fs::create_dir_all(&dir).unwrap();
+        let task_file = dir.join("task.toml");
+        std::fs::write(&task_file, "orig").unwrap();
+        let protected = HashSet::from([task_file.canonicalize().unwrap()]);
+        let tool = EditTool::new(Some(dir.clone())).with_protected_paths(protected);
+        let out = tool.run(&serde_json::json!({
+            "path": "task.toml",
+            "edits": [{"oldText": "orig", "newText": "evil"}]
+        }));
+        assert!(out.starts_with("Error:"), "expected protected-path edit to be rejected, got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_blocks_protected_path_argument() {
+        let dir = unique_test_dir("bash_protected");
+        std::fs::create_dir_all(&dir).unwrap();
+        let task_file = dir.join("task.toml");
+        std::fs::write(&task_file, "secret plan").unwrap();
+        let protected = HashSet::from([task_file.canonicalize().unwrap()]);
+        let allow: HashSet<String> = ["grep", "find", "sed"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow)).with_protected_paths(protected);
+
+        let out = tool.run(&serde_json::json!({"command": "grep secret task.toml"}));
+        assert!(out.starts_with("Error:"), "expected read of protected path to be rejected, got: {out}");
+        assert!(!out.contains("secret plan"));
+
+        let delete_out = tool.run(&serde_json::json!({"command": "find . -name task.toml -delete"}));
+        assert!(delete_out.starts_with("Error:"));
+        assert!(task_file.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_allows_non_protected_path_argument() {
+        let dir = unique_test_dir("bash_not_protected");
+        std::fs::create_dir_all(&dir).unwrap();
+        let task_file = dir.join("task.toml");
+        std::fs::write(&task_file, "secret plan").unwrap();
+        std::fs::write(dir.join("other.txt"), "hello world").unwrap();
+        let protected = HashSet::from([task_file.canonicalize().unwrap()]);
+        let allow: HashSet<String> = ["grep"].iter().map(|s| s.to_string()).collect();
+        let tool = BashTool::new(Some(dir.clone()), true, Some(allow)).with_protected_paths(protected);
+
+        let out = tool.run(&serde_json::json!({"command": "grep hello other.txt"}));
+        assert!(!out.starts_with("Error:"), "unexpected error for non-protected file: {out}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

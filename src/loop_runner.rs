@@ -604,12 +604,23 @@ impl PromptLoopRunner {
 
     fn load_task_context(&mut self) -> anyhow::Result<()> {
         let (messages, meta) = crate::chat_template::load_chat_template(&self.task_path)?;
-        self.chat_history = messages
-            .into_iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-            .collect();
+        self.chat_history = Self::messages_to_json(messages);
         self.bash_allow = meta.bash_allow;
         Ok(())
+    }
+
+    fn messages_to_json(messages: Vec<crate::chat_template::ChatMessage>) -> Vec<serde_json::Value> {
+        messages
+            .into_iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect()
+    }
+
+    /// Resolved paths the agent's own tools may never read/write/edit — currently just
+    /// the task file, which grants tool policy at construction time (see `bash_allow`)
+    /// and must not be tool-mutable mid-run.
+    fn protected_paths(&self) -> HashSet<PathBuf> {
+        HashSet::from([self.task_path.clone()])
     }
 
     fn initialize_paths(&self) -> anyhow::Result<()> {
@@ -632,10 +643,16 @@ impl PromptLoopRunner {
         write_state(&self.paths.state_toml, self.state.clone())
     }
 
+    /// Only the task content (`chat_history`) is refreshed here. The bash allowlist /
+    /// tool policy is fixed once in `load_task_context()` at construction time and must
+    /// never be re-derived mid-run: the task file lives inside the agent's own writable
+    /// root, so re-reading its `[tools].bash` on every edit would let the agent grant
+    /// itself new bash commands by rewriting its own task file.
     fn reload_task_context_if_needed(&mut self) -> anyhow::Result<()> {
         let current_mtime = std::fs::metadata(&self.task_path).and_then(|m| m.modified()).ok();
         if current_mtime != self.task_mtime {
-            self.load_task_context()?;
+            let (messages, _meta) = crate::chat_template::load_chat_template(&self.task_path)?;
+            self.chat_history = Self::messages_to_json(messages);
             self.task_mtime = current_mtime;
         }
         Ok(())
@@ -675,7 +692,7 @@ impl PromptLoopRunner {
 
     fn build_author_agent(&self, logging: Box<dyn crate::logging::ToolLogSink>) -> anyhow::Result<Agent> {
         let model = Box::new(AnthropicModel::new(self.model.clone(), self.reason)?);
-        let tools = make_tools(&self.workdir_path, &self.bash_allow);
+        let tools = make_tools(&self.workdir_path, &self.bash_allow, &self.protected_paths());
         Ok(Agent::new(model, tools, self.agent_iterations, self.build_observer(), logging))
     }
 
@@ -763,11 +780,17 @@ impl PromptLoopRunner {
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
+        let protected_paths = self.protected_paths();
         vec![
             Box::new(ReadTool::new(Some(self.workdir_path.clone()))),
             Box::new(GlobTool::new(Some(self.workdir_path.clone()))),
-            Box::new(WriteTool::new(Some(self.workdir_path.clone()))),
-            Box::new(BashTool::new(Some(self.workdir_path.clone()), true, Some(review_bash_allow))),
+            Box::new(
+                WriteTool::new(Some(self.workdir_path.clone())).with_protected_paths(protected_paths.clone()),
+            ),
+            Box::new(
+                BashTool::new(Some(self.workdir_path.clone()), true, Some(review_bash_allow))
+                    .with_protected_paths(protected_paths),
+            ),
         ]
     }
 

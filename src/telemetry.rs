@@ -14,6 +14,34 @@ pub fn ensure_loop_metadata_dir(loop_dir: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+const MAX_FIELD_CHARS: usize = 500;
+
+/// Recursively truncate long strings (e.g. a `write` call's full file `content`, or
+/// `edit`'s `oldText`/`newText`) before they're persisted to metadata TOML. Mirrors the
+/// 500-char cap already applied to `output_preview` — without this, `args` has no size
+/// limit at all, so a tool call touching a large/secret-bearing file persists it in full,
+/// in plaintext, to `<loop_dir>/metadata/*.toml` forever.
+fn cap_strings(value: &serde_json::Value, limit: usize) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            let char_count = s.chars().count();
+            if char_count > limit {
+                let truncated: String = s.chars().take(limit).collect();
+                serde_json::Value::String(format!("{truncated}... [truncated, {char_count} chars total]"))
+            } else {
+                value.clone()
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(|v| cap_strings(v, limit)).collect())
+        }
+        serde_json::Value::Object(map) => {
+            serde_json::Value::Object(map.iter().map(|(k, v)| (k.clone(), cap_strings(v, limit))).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 /// Convert a JSON value into a TOML value tree. `Null` becomes an empty string, since
 /// TOML has no null type and tool-call args occasionally carry JSON nulls for optional
 /// fields; this keeps phase-metadata serialization infallible rather than panicking or
@@ -81,7 +109,7 @@ pub fn write_loop_phase_metadata(
         .map(|t| {
             let mut row = toml::Table::new();
             row.insert("name".into(), toml::Value::String(t.name.clone()));
-            row.insert("args".into(), json_to_toml(&t.args));
+            row.insert("args".into(), json_to_toml(&cap_strings(&t.args, MAX_FIELD_CHARS)));
             row.insert("ok".into(), toml::Value::Boolean(t.ok));
             row.insert("output_preview".into(), toml::Value::String(t.output_preview.clone()));
             toml::Value::Table(row)
@@ -93,7 +121,7 @@ pub fn write_loop_phase_metadata(
         .map(|r| {
             let mut row = toml::Table::new();
             row.insert("name".into(), toml::Value::String(r.name.clone()));
-            row.insert("args".into(), json_to_toml(&r.args));
+            row.insert("args".into(), json_to_toml(&cap_strings(&r.args, MAX_FIELD_CHARS)));
             row.insert("reason".into(), toml::Value::String(r.reason.as_str().to_string()));
             toml::Value::Table(row)
         })
@@ -145,4 +173,125 @@ pub fn write_loop_manifest(
     let out = metadata_dir.join("manifest.toml");
     atomic_write_toml(&out, &toml::Value::Table(manifest))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{RejectReason, TokenUsage};
+
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("csloop_test_telemetry_{tag}_{nanos}"))
+    }
+
+    #[test]
+    fn cap_strings_truncates_long_string() {
+        let long = "x".repeat(10_000);
+        let capped = cap_strings(&serde_json::json!(long), MAX_FIELD_CHARS);
+        let s = capped.as_str().unwrap();
+        assert!(s.len() < 10_000);
+        assert!(s.contains("truncated, 10000 chars total"));
+    }
+
+    #[test]
+    fn cap_strings_leaves_short_string_untouched() {
+        let capped = cap_strings(&serde_json::json!("short"), MAX_FIELD_CHARS);
+        assert_eq!(capped.as_str().unwrap(), "short");
+    }
+
+    #[test]
+    fn cap_strings_recurses_into_nested_args() {
+        let value = serde_json::json!({
+            "path": "secret.env",
+            "content": "x".repeat(10_000),
+            "edits": [{"oldText": "y".repeat(10_000), "newText": "z"}]
+        });
+        let capped = cap_strings(&value, MAX_FIELD_CHARS);
+        assert!(capped["content"].as_str().unwrap().len() < 10_000);
+        assert!(capped["edits"][0]["oldText"].as_str().unwrap().len() < 10_000);
+        assert_eq!(capped["edits"][0]["newText"].as_str().unwrap(), "z");
+        assert_eq!(capped["path"].as_str().unwrap(), "secret.env");
+    }
+
+    #[test]
+    fn write_loop_phase_metadata_caps_persisted_args() {
+        // Regression test: unlike `output_preview` (already capped to 500 chars), `args`
+        // had no size limit, so a `write` call's full file content — potentially a secret
+        // — was persisted to metadata TOML in plaintext, uncapped.
+        let dir = unique_test_dir("caps_args");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let big_content = "x".repeat(10_000);
+        let tool_results = vec![crate::agent::ToolResult {
+            name: "write".to_string(),
+            args: serde_json::json!({"path": "secret.env", "content": big_content}),
+            ok: true,
+            output_preview: "Wrote secret.env".to_string(),
+        }];
+
+        let out = write_loop_phase_metadata(
+            &dir,
+            "r1",
+            1,
+            "author",
+            "m",
+            "t",
+            "w",
+            "done",
+            true,
+            &TokenUsage::default(),
+            1,
+            &tool_results,
+            &[],
+            1.0,
+        )
+        .unwrap();
+
+        let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let persisted_content = doc["tools"][0]["args"]["content"].as_str().unwrap();
+        assert!(persisted_content.len() < 1000, "expected capped content, got {} chars", persisted_content.len());
+        assert!(persisted_content.contains("truncated"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_loop_phase_metadata_caps_rejected_args_too() {
+        let dir = unique_test_dir("caps_rejected_args");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let rejected = vec![crate::agent::RejectedCall {
+            name: "write".to_string(),
+            args: serde_json::json!({"content": "y".repeat(10_000)}),
+            reason: RejectReason::RepeatBlocked,
+        }];
+
+        let out = write_loop_phase_metadata(
+            &dir,
+            "r1",
+            1,
+            "author",
+            "m",
+            "t",
+            "w",
+            "done",
+            true,
+            &TokenUsage::default(),
+            1,
+            &[],
+            &rejected,
+            1.0,
+        )
+        .unwrap();
+
+        let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let persisted_content = doc["rejected_calls"][0]["args"]["content"].as_str().unwrap();
+        assert!(persisted_content.len() < 1000);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
