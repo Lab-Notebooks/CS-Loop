@@ -1,6 +1,6 @@
 [package]
 name = "csloop"
-version = "2026.7.0"
+version = "2026.7.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Bounded author/review agent loop against Anthropic models"
