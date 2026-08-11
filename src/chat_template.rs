@@ -1,3 +1,8 @@
+// Copyright (c) 2026 UChicago Argonne LLC
+// CS-Loop (SF-26-122)
+// SPDX-License-Identifier: GPL-3.0-only
+// Full license and notices: see LICENSE and NOTICE in the repo root.
+
 //! Task-file TOML chat-template parsing and validation.
 //!
 //! Ports `codescribe/lib/_filetools.py::load_chat_template` only (the rest of that

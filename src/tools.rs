@@ -1,3 +1,8 @@
+// Copyright (c) 2026 UChicago Argonne LLC
+// CS-Loop (SF-26-122)
+// SPDX-License-Identifier: GPL-3.0-only
+// Full license and notices: see LICENSE and NOTICE in the repo root.
+
 //! Filesystem + shell tools for the coding agent.
 //!
 //! Ports `codescribe/lib/_tools.py`.

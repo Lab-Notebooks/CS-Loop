@@ -1,3 +1,8 @@
+// Copyright (c) 2026 UChicago Argonne LLC
+// CS-Loop (SF-26-122)
+// SPDX-License-Identifier: GPL-3.0-only
+// Full license and notices: see LICENSE and NOTICE in the repo root.
+
 //! CLI surface for `csloop` — a flat command (no subcommand) since the binary's only
 //! job is running the author/review loop.
 //!
@@ -14,8 +19,21 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// `--version` body: crate version followed by the disclosure and license statement.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nCS-Loop (SF-26-122)",
+    "\nCopyright (c) 2026 UChicago Argonne LLC",
+    "\nLicense GPL-3.0-only — see LICENSE and NOTICE.",
+);
+
 #[derive(Parser, Debug)]
-#[command(name = "csloop", version, about = "Bounded author/review agent loop against Anthropic models")]
+#[command(
+    name = "csloop",
+    version = VERSION,
+    about = "Bounded author/review agent loop against Anthropic models",
+    after_help = "CS-Loop (SF-26-122) — Copyright (c) 2026 UChicago Argonne LLC, GPL-3.0-only.",
+)]
 pub struct Cli {
     /// TOML task file (chat template) describing the work to do.
     pub task_file: PathBuf,

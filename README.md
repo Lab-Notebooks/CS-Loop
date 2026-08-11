@@ -88,3 +88,6 @@ directory.
 ## License
 
 GPL-3.0-only — see [LICENSE](LICENSE).
+
+CS-Loop (SF-26-122), Copyright (c) 2026 UChicago Argonne LLC — see [NOTICE](NOTICE)
+for the full copyright and attribution statement.

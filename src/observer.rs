@@ -1,3 +1,8 @@
+// Copyright (c) 2026 UChicago Argonne LLC
+// CS-Loop (SF-26-122)
+// SPDX-License-Identifier: GPL-3.0-only
+// Full license and notices: see LICENSE and NOTICE in the repo root.
+
 //! Verbose-mode console tracking: per-iteration spinner, dimmed reasoning printing,
 //! tool start/end one-liners, comma-grouped token usage lines.
 //!

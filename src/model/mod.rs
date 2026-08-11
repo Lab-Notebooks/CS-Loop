@@ -1,3 +1,8 @@
+// Copyright (c) 2026 UChicago Argonne LLC
+// CS-Loop (SF-26-122)
+// SPDX-License-Identifier: GPL-3.0-only
+// Full license and notices: see LICENSE and NOTICE in the repo root.
+
 //! Model-facing interface shared by all backends. Anthropic is the only implementation
 //! (see `anthropic.rs`) — this crate is deliberately single-backend.
 

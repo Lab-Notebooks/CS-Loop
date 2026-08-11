@@ -1,3 +1,8 @@
+// Copyright (c) 2026 UChicago Argonne LLC
+// CS-Loop (SF-26-122)
+// SPDX-License-Identifier: GPL-3.0-only
+// Full license and notices: see LICENSE and NOTICE in the repo root.
+
 //! Bounded author → review agent loop orchestration.
 //!
 //! Ports `codescribe/lib/_loop.py` (minus the `LoopPaths`/`get_loop_paths` section,
