@@ -604,7 +604,7 @@ impl Agent {
                 "iteration": iteration,
                 "tool": name,
                 "args": args,
-                "model_reasoning": model_text,
+                "model_text": model_text,
             }));
 
             let raw_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.run(args))) {
